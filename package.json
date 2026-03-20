@@ -1,11 +1,11 @@
 {
   "name": "standin-ai-backend",
   "version": "1.0.0",
-  "description": "StandIn AI - Free Backend Server",
-  "main": "src/index.js",
+  "description": "StandIn AI Free Backend",
+  "main": "index.js",
   "scripts": {
-    "start": "node src/index.js",
-    "dev":   "nodemon src/index.js"
+    "start": "node index.js",
+    "dev":   "nodemon index.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.15.0",
