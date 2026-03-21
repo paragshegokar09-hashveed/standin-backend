@@ -110,15 +110,30 @@ app.post('/api/auth/verify-firebase', async (req, res) => {
   }
 });
 
-// Update name and language
+// Set name — ONE TIME ONLY, cannot be changed after first save
 app.post('/api/auth/profile', authMiddleware, async (req, res) => {
   try {
     const { name, language } = req.body;
+
+    // Check if name already set
+    const { data: user } = await supabase
+      .from('users').select('name').eq('id', req.userId).single();
+
+    if (user?.name) {
+      // Name already set — return it, do not update
+      return res.status(403).json({
+        error: 'Name cannot be changed once it is set.',
+        existingName: user.name,
+      });
+    }
+
+    // First time setting name — save it permanently
     await supabase.from('users')
-      .update({ name, language }).eq('id', req.userId);
-    res.json({ success: true });
+      .update({ name: name.trim(), language }).eq('id', req.userId);
+
+    res.json({ success: true, name: name.trim() });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to update profile' });
+    res.status(500).json({ error: 'Failed to save name' });
   }
 });
 
