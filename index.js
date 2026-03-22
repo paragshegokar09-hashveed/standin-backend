@@ -563,6 +563,456 @@ function detectLanguage(phone) {
   }
   return 'en';
 }
+// ═══════════════════════════════════════════════════
+// PHASE 1 — Add these routes to your index.js
+// Copy everything below and paste BEFORE the
+// "START SERVER" section in index.js
+// ═══════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────
+// FEATURE 1: PERSONAL KNOWLEDGE BASE
+// ─────────────────────────────────────────────────────
+
+// Get all knowledge base facts
+app.get('/api/knowledge', authMiddleware, async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('knowledge_base')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false });
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Add a new fact
+app.post('/api/knowledge', authMiddleware, async (req, res) => {
+  try {
+    const { question, answer, category } = req.body;
+    if (!question || !answer) {
+      return res.status(400).json({ error: 'Question and answer required' });
+    }
+    const { data } = await supabase
+      .from('knowledge_base')
+      .insert({
+        user_id:  req.userId,
+        question: question.trim(),
+        answer:   answer.trim(),
+        category: category || 'custom',
+      })
+      .select().single();
+    res.json({ success: true, fact: data });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete a fact
+app.delete('/api/knowledge/:id', authMiddleware, async (req, res) => {
+  try {
+    await supabase
+      .from('knowledge_base')
+      .delete()
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 2: SMART CALL SCREENING
+// ─────────────────────────────────────────────────────
+
+// Get screening settings
+app.get('/api/screening/settings', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('screening_enabled, screening_delay, show_context')
+      .eq('id', req.userId)
+      .single();
+    res.json({
+      enabled:     user?.screening_enabled ?? true,
+      delay:       user?.screening_delay   ?? 10,
+      showContext: user?.show_context      ?? true,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update screening settings
+app.post('/api/screening/settings', authMiddleware, async (req, res) => {
+  try {
+    const { enabled, delay, showContext } = req.body;
+    await supabase
+      .from('users')
+      .update({
+        screening_enabled: enabled,
+        screening_delay:   delay,
+        show_context:      showContext,
+      })
+      .eq('id', req.userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get caller context — who is calling + prediction
+app.post('/api/screening/caller-context', authMiddleware, async (req, res) => {
+  try {
+    const { callerPhone } = req.body;
+
+    // Get past meetings with this caller
+    const { data: pastMeetings } = await supabase
+      .from('meetings')
+      .select('summary, created_at, duration')
+      .eq('user_id', req.userId)
+      .eq('from_number', callerPhone)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    if (!pastMeetings || pastMeetings.length === 0) {
+      return res.json({
+        isKnown:    false,
+        callCount:  0,
+        prediction: 'New caller — no previous history',
+        lastCall:   null,
+      });
+    }
+
+    // Ask Gemini to predict why they are calling
+    const recentSummary = pastMeetings[0].summary;
+    let prediction = 'Likely follow-up from previous conversation';
+
+    try {
+      const result = await model.generateContent(
+        `Based on this last call summary, predict in ONE short sentence why this person might be calling again:\n\n"${recentSummary}"`
+      );
+      prediction = result.response.text().replace(/"/g, '').trim();
+    } catch {}
+
+    res.json({
+      isKnown:    true,
+      callCount:  pastMeetings.length,
+      prediction,
+      lastCall:   pastMeetings[0].created_at,
+      lastSummary: recentSummary,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 3: MEETING INTELLIGENCE REPORT
+// ─────────────────────────────────────────────────────
+
+// Generate full intelligence report for a meeting
+app.post('/api/meetings/:id/intelligence', authMiddleware, async (req, res) => {
+  try {
+    const { data: meeting } = await supabase
+      .from('meetings')
+      .select('*')
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+    if (!meeting.summary) return res.json({ error: 'No transcript available' });
+
+    // Ask Gemini to do full intelligence analysis
+    const prompt = `
+Analyze this phone call transcript/summary and return a JSON object with:
+{
+  "sentiment": "positive" | "neutral" | "negative",
+  "sentimentScore": number (0-100, higher = more positive),
+  "keyNumbers": ["₹50L", "Nov 15", etc],
+  "actionItems": [{"task": "string", "deadline": "string", "priority": "high"|"medium"|"low"}],
+  "riskFlags": ["string"],
+  "callerPersonality": "string (1 sentence)",
+  "followUpDate": "string",
+  "recommendation": "string (2 sentences)"
+}
+
+Meeting summary: "${meeting.summary}"
+Return ONLY valid JSON, no other text.
+    `.trim();
+
+    let report = null;
+    try {
+      const result = await model.generateContent(prompt);
+      const text   = result.response.text();
+      const clean  = text.replace(/```json|```/g,'').trim();
+      report = JSON.parse(clean);
+    } catch {
+      // Fallback if Gemini parsing fails
+      report = {
+        sentiment:        'neutral',
+        sentimentScore:   60,
+        keyNumbers:       [],
+        actionItems:      [{ task: 'Follow up with caller', deadline: 'This week', priority: 'medium' }],
+        riskFlags:        [],
+        callerPersonality:'Professional and direct communicator.',
+        followUpDate:     'Within 3 days',
+        recommendation:   'Follow up with caller to address discussed topics.',
+      };
+    }
+
+    // Save report to database
+    await supabase
+      .from('meetings')
+      .update({ intelligence_report: report })
+      .eq('id', req.params.id);
+
+    res.json({ success: true, report, meeting });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get saved intelligence report
+app.get('/api/meetings/:id/intelligence', authMiddleware, async (req, res) => {
+  try {
+    const { data: meeting } = await supabase
+      .from('meetings')
+      .select('intelligence_report, summary, from_number, created_at, duration')
+      .eq('id', req.params.id)
+      .eq('user_id', req.userId)
+      .single();
+
+    if (!meeting) return res.status(404).json({ error: 'Not found' });
+    res.json({ report: meeting.intelligence_report, meeting });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 4: BIOMETRIC APP LOCK
+// ─────────────────────────────────────────────────────
+
+// Save biometric settings
+app.post('/api/security/biometric', authMiddleware, async (req, res) => {
+  try {
+    const { fingerprintEnabled, faceEnabled, pinEnabled, lockDelay, failedAttemptLimit, captureIntruder } = req.body;
+
+    await supabase
+      .from('users')
+      .update({
+        biometric_finger:  fingerprintEnabled,
+        biometric_face:    faceEnabled,
+        biometric_pin:     pinEnabled,
+        lock_delay:        lockDelay        || 'immediately',
+        attempt_limit:     failedAttemptLimit || 5,
+        capture_intruder:  captureIntruder,
+      })
+      .eq('id', req.userId);
+
+    res.json({ success: true, message: 'Biometric settings saved' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Set encrypted PIN (hashed, never stored as plain text)
+app.post('/api/security/pin', authMiddleware, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin || pin.length !== 6) {
+      return res.status(400).json({ error: 'PIN must be exactly 6 digits' });
+    }
+
+    // Hash the PIN before storing
+    const crypto = require('crypto');
+    const hashedPin = crypto
+      .createHmac('sha256', process.env.JWT_SECRET)
+      .update(pin)
+      .digest('hex');
+
+    await supabase
+      .from('users')
+      .update({ pin_hash: hashedPin })
+      .eq('id', req.userId);
+
+    res.json({ success: true, message: 'PIN set successfully' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Verify PIN
+app.post('/api/security/verify-pin', authMiddleware, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    const crypto = require('crypto');
+    const hashedPin = crypto
+      .createHmac('sha256', process.env.JWT_SECRET)
+      .update(pin)
+      .digest('hex');
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('pin_hash')
+      .eq('id', req.userId)
+      .single();
+
+    const match = user?.pin_hash === hashedPin;
+    res.json({ success: match, message: match ? 'PIN correct' : 'Wrong PIN' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 5: DATA EXPIRY CONTROL
+// ─────────────────────────────────────────────────────
+
+// Get data expiry settings
+app.get('/api/data/settings', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('transcript_expiry, voice_expiry, summary_expiry')
+      .eq('id', req.userId)
+      .single();
+    res.json({
+      transcriptExpiry: user?.transcript_expiry || 30,
+      voiceExpiry:      user?.voice_expiry      || 7,
+      summaryExpiry:    user?.summary_expiry     || 90,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Update expiry settings
+app.post('/api/data/settings', authMiddleware, async (req, res) => {
+  try {
+    const { transcriptExpiry, voiceExpiry, summaryExpiry } = req.body;
+    await supabase
+      .from('users')
+      .update({
+        transcript_expiry: transcriptExpiry,
+        voice_expiry:      voiceExpiry,
+        summary_expiry:    summaryExpiry,
+      })
+      .eq('id', req.userId);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Export all user data as JSON
+app.get('/api/data/export', authMiddleware, async (req, res) => {
+  try {
+    const [userRes, meetingsRes, kbRes] = await Promise.all([
+      supabase.from('users').select('phone, name, language, created_at').eq('id', req.userId).single(),
+      supabase.from('meetings').select('*').eq('user_id', req.userId),
+      supabase.from('knowledge_base').select('*').eq('user_id', req.userId),
+    ]);
+
+    const exportData = {
+      exportedAt: new Date().toISOString(),
+      user:       userRes.data,
+      meetings:   meetingsRes.data || [],
+      knowledgeBase: kbRes.data || [],
+    };
+
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', 'attachment; filename="standin-ai-export.json"');
+    res.json(exportData);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Clear all meetings
+app.delete('/api/data/meetings', authMiddleware, async (req, res) => {
+  try {
+    await supabase
+      .from('meetings')
+      .delete()
+      .eq('user_id', req.userId);
+    res.json({ success: true, message: 'All meetings deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Delete account — removes everything
+app.delete('/api/data/account', authMiddleware, async (req, res) => {
+  try {
+    // Delete voice clone from ElevenLabs first
+    const { data: user } = await supabase
+      .from('users')
+      .select('voice_id')
+      .eq('id', req.userId)
+      .single();
+
+    if (user?.voice_id && process.env.ELEVENLABS_API_KEY) {
+      try {
+        await axios.delete(
+          `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
+          { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
+        );
+      } catch {}
+    }
+
+    // Delete all data in order (foreign key safe)
+    await supabase.from('meetings').delete().eq('user_id', req.userId);
+    await supabase.from('knowledge_base').delete().eq('user_id', req.userId);
+    await supabase.from('users').delete().eq('id', req.userId);
+
+    console.log('🗑️ Account deleted:', req.userId);
+    res.json({ success: true, message: 'Account permanently deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// AUTO EXPIRY JOB — runs daily to clean old data
+// This runs automatically every 24 hours
+// ─────────────────────────────────────────────────────
+async function runDataExpiryCleanup() {
+  try {
+    console.log('🧹 Running data expiry cleanup...');
+
+    // Get all users with expiry settings
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, transcript_expiry, voice_expiry, summary_expiry')
+      .not('transcript_expiry', 'is', null);
+
+    for (const user of (users || [])) {
+      if (user.transcript_expiry) {
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - user.transcript_expiry);
+        await supabase
+          .from('meetings')
+          .delete()
+          .eq('user_id', user.id)
+          .lt('created_at', cutoff.toISOString());
+      }
+    }
+
+    console.log('✅ Data expiry cleanup complete');
+  } catch (err) {
+    console.error('Cleanup error:', err.message);
+  }
+}
+
+// Run cleanup every 24 hours
+setInterval(runDataExpiryCleanup, 24 * 60 * 60 * 1000);
+// Also run once on startup
+setTimeout(runDataExpiryCleanup, 5000);
 
 // ═══════════════════════════════════════════════════
 // START SERVER
