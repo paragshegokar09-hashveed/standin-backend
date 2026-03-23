@@ -567,15 +567,22 @@ function detectLanguage(phone) {
 
 
 
-// ═══════════════════════════════════════════════════
-// VOICE CLONE ROUTES
-// ═══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
+// VOICE CLONE ROUTES (ElevenLabs)
+// ══════════════════════════════════════════════════
 // backend — Voice Clone Route
 // POST /api/voice/clone
 // Receives 4 base64 audio recordings → sends to ElevenLabs → returns voiceId
 
+// (merged-removed): const express    = require('express');
+// (merged-removed): const router     = express.Router();
+// (merged-removed): const axios      = require('axios');
+// (merged-removed): const FormData   = require('form-data');
+// (merged-removed): const crypto     = require('crypto');
+// (merged-removed): const { createClient } = require('@supabase/supabase-js');
+// (merged-removed): const authMiddleware = require('../middleware/auth');
 
-// (removed duplicate) const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// (merged-removed): const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // ── ADD TO index.js ──────────────────────────────────
 // const voiceRoutes = require('./routes/voice');
@@ -776,12 +783,12 @@ router.post('/speak', authMiddleware, async (req, res) => {
   }
 });
 
-module.exports = router;
+// (merged-removed): module.exports = router;
 
 
-// ═══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
 // PHASE 1 ROUTES
-// ═══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════
 // PHASE 1 — Add these routes to your index.js
 // Copy everything below and paste BEFORE the
@@ -1048,6 +1055,7 @@ app.post('/api/security/pin', authMiddleware, async (req, res) => {
     }
 
     // Hash the PIN before storing
+// (inline-removed - use global crypto): 
     const hashedPin = crypto
       .createHmac('sha256', process.env.JWT_SECRET)
       .update(pin)
@@ -1068,6 +1076,7 @@ app.post('/api/security/pin', authMiddleware, async (req, res) => {
 app.post('/api/security/verify-pin', authMiddleware, async (req, res) => {
   try {
     const { pin } = req.body;
+// (inline-removed - use global crypto): 
     const hashedPin = crypto
       .createHmac('sha256', process.env.JWT_SECRET)
       .update(pin)
@@ -1232,9 +1241,9 @@ setInterval(runDataExpiryCleanup, 24 * 60 * 60 * 1000);
 setTimeout(runDataExpiryCleanup, 5000);
 
 
-// ═══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
 // PHASE 2 ROUTES
-// ═══════════════════════════════════════════════════
+// ══════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════
 // PHASE 2 BACKEND ROUTES
 // Add these to index.js BEFORE the "START SERVER" section
@@ -1607,6 +1616,7 @@ app.get('/api/fraud/alerts', authMiddleware, async (req, res) => {
 // FEATURE 5: END-TO-END ENCRYPTION
 // Encrypts all transcripts with user's own key
 // ─────────────────────────────────────────────────────
+// (merged-removed): const crypto = require('crypto');
 
 // Generate encryption key for user
 app.post('/api/security/generate-key', authMiddleware, async (req, res) => {
