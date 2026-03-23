@@ -563,6 +563,230 @@ function detectLanguage(phone) {
   }
   return 'en';
 }
+
+
+
+// ═══════════════════════════════════════════════════
+// VOICE CLONE ROUTES
+// ═══════════════════════════════════════════════════
+// backend — Voice Clone Route
+// POST /api/voice/clone
+// Receives 4 base64 audio recordings → sends to ElevenLabs → returns voiceId
+
+const express    = require('express');
+const router     = express.Router();
+const axios      = require('axios');
+const FormData   = require('form-data');
+const { createClient } = require('@supabase/supabase-js');
+const authMiddleware = require('../middleware/auth');
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+
+// ── ADD TO index.js ──────────────────────────────────
+// const voiceRoutes = require('./routes/voice');
+// app.use('/api/voice', voiceRoutes);
+// ─────────────────────────────────────────────────────
+
+// POST /api/voice/clone
+// Body: { userName: string, audioFiles: string[] } (base64 encoded)
+router.post('/clone', authMiddleware, async (req, res) => {
+  try {
+    const { userName, audioFiles } = req.body;
+
+    if (!audioFiles || audioFiles.length < 4) {
+      return res.status(400).json({ error: 'All 4 voice recordings are required' });
+    }
+
+    // Check if user already has a voice clone
+    const { data: user } = await supabase
+      .from('users')
+      .select('voice_id')
+      .eq('id', req.userId)
+      .single();
+
+    // If voice already exists — delete old one from ElevenLabs first
+    if (user?.voice_id) {
+      try {
+        await axios.delete(
+          `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
+          { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
+        );
+      } catch {
+        // Old voice deletion failed — continue anyway
+      }
+    }
+
+    // ── BUILD FORM DATA FOR ELEVENLABS ─────────────────
+    const form = new FormData();
+    form.append('name', `StandIn_${userName}_${req.userId}`);
+
+    // Add each audio recording as a file
+    audioFiles.forEach((base64Audio, index) => {
+      const buffer = Buffer.from(base64Audio, 'base64');
+      form.append('files', buffer, {
+        filename:    `sentence_${index + 1}.mp3`,
+        contentType: 'audio/mpeg',
+      });
+    });
+
+    // Labels for ElevenLabs (metadata)
+    form.append('labels', JSON.stringify({
+      userId:   req.userId,
+      userName: userName,
+      purpose:  'StandIn AI Voice Clone',
+    }));
+
+    // ── CALL ELEVENLABS API ───────────────────────────
+    const elevenResponse = await axios.post(
+      'https://api.elevenlabs.io/v1/voices/add',
+      form,
+      {
+        headers: {
+          ...form.getHeaders(),
+          'xi-api-key': process.env.ELEVENLABS_API_KEY,
+        },
+        timeout: 60000, // 60 second timeout for upload
+      }
+    );
+
+    const voiceId = elevenResponse.data.voice_id;
+
+    if (!voiceId) {
+      return res.status(500).json({ error: 'ElevenLabs did not return a voice ID' });
+    }
+
+    // ── SAVE VOICE ID TO DATABASE ─────────────────────
+    await supabase
+      .from('users')
+      .update({ voice_id: voiceId })
+      .eq('id', req.userId);
+
+    res.json({
+      success: true,
+      voiceId,
+      message: '✅ Voice clone created successfully!',
+    });
+
+  } catch (err) {
+    console.error('Voice clone error:', err?.response?.data || err.message);
+    const msg = err?.response?.data?.detail?.message || err.message || 'Voice clone failed';
+    res.status(500).json({ error: msg });
+  }
+});
+
+// ── GET USER'S VOICE STATUS ───────────────────────────
+router.get('/status', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('voice_id')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user?.voice_id) {
+      return res.json({ hasVoice: false });
+    }
+
+    // Check if voice still exists in ElevenLabs
+    try {
+      const response = await axios.get(
+        `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
+        { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
+      );
+      res.json({
+        hasVoice: true,
+        voiceId:  user.voice_id,
+        voiceName: response.data.name,
+      });
+    } catch {
+      // Voice no longer exists in ElevenLabs
+      res.json({ hasVoice: false });
+    }
+
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── DELETE VOICE CLONE ────────────────────────────────
+router.delete('/clone', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('voice_id')
+      .eq('id', req.userId)
+      .single();
+
+    if (user?.voice_id) {
+      await axios.delete(
+        `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
+        { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
+      );
+      await supabase
+        .from('users')
+        .update({ voice_id: null })
+        .eq('id', req.userId);
+    }
+
+    res.json({ success: true, message: 'Voice clone deleted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── USE VOICE IN MEETING (called internally by AI) ────
+// This is used by the Gemini AI service to speak via ElevenLabs
+router.post('/speak', authMiddleware, async (req, res) => {
+  try {
+    const { text, voiceId } = req.body;
+
+    if (!text) return res.status(400).json({ error: 'Text is required' });
+    if (!voiceId) return res.status(400).json({ error: 'Voice ID is required' });
+
+    // Call ElevenLabs text-to-speech
+    const response = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
+      {
+        text,
+        model_id: 'eleven_multilingual_v2', // supports 29 languages
+        voice_settings: {
+          stability:        0.75, // consistent tone
+          similarity_boost: 0.85, // close to original voice
+          style:            0.5,  // natural expression
+          use_speaker_boost: true,
+        },
+      },
+      {
+        headers: {
+          'xi-api-key':   process.env.ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept':       'audio/mpeg',
+        },
+        responseType: 'arraybuffer',
+        timeout:      30000,
+      }
+    );
+
+    // Return audio as base64 — mobile app plays it
+    const audioBase64 = Buffer.from(response.data).toString('base64');
+    res.json({
+      success:    true,
+      audio:      audioBase64,
+      mimeType:   'audio/mpeg',
+    });
+
+  } catch (err) {
+    console.error('Voice speak error:', err?.response?.data || err.message);
+    res.status(500).json({ error: 'Could not generate speech' });
+  }
+});
+
+module.exports = router;
+
+
+// ═══════════════════════════════════════════════════
+// PHASE 1 ROUTES
+// ═══════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════
 // PHASE 1 — Add these routes to your index.js
 // Copy everything below and paste BEFORE the
@@ -1014,6 +1238,10 @@ setInterval(runDataExpiryCleanup, 24 * 60 * 60 * 1000);
 // Also run once on startup
 setTimeout(runDataExpiryCleanup, 5000);
 
+
+// ═══════════════════════════════════════════════════
+// PHASE 2 ROUTES
+// ═══════════════════════════════════════════════════
 // ═══════════════════════════════════════════════════
 // PHASE 2 BACKEND ROUTES
 // Add these to index.js BEFORE the "START SERVER" section
@@ -1277,7 +1505,7 @@ app.get('/api/calendar/upcoming', authMiddleware, async (req, res) => {
       }
     );
 
-    const events = (response.data.items || []).map((e: any) => ({
+    const events = (response.data.items || []).map((e) => ({
       id:       e.id,
       title:    e.summary,
       start:    e.start?.dateTime || e.start?.date,
@@ -1343,7 +1571,7 @@ app.post('/api/agent/fraud-check', authMiddleware, async (req, res) => {
       if (fraud.level === 'HIGH') {
         const session = aiSessions.get(meetingId);
         if (session) {
-          const safePhrases: any = {
+          const safePhrases = {
             hi: 'मैं आपको आधिकारिक नंबर से वापस कॉल करूंगा।',
             en: 'I will call you back on the official number. Thank you.',
             ar: 'سأعاود الاتصال بك على الرقم الرسمي.',
@@ -1463,219 +1691,6 @@ app.post('/api/security/decrypt', authMiddleware, async (req, res) => {
   }
 });
 
-// backend — Voice Clone Route
-// POST /api/voice/clone
-// Receives 4 base64 audio recordings → sends to ElevenLabs → returns voiceId
-
-const express    = require('express');
-const router     = express.Router();
-const axios      = require('axios');
-const FormData   = require('form-data');
-const { createClient } = require('@supabase/supabase-js');
-const authMiddleware = require('../middleware/auth');
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-
-// ── ADD TO index.js ──────────────────────────────────
-// const voiceRoutes = require('./routes/voice');
-// app.use('/api/voice', voiceRoutes);
-// ─────────────────────────────────────────────────────
-
-// POST /api/voice/clone
-// Body: { userName: string, audioFiles: string[] } (base64 encoded)
-router.post('/clone', authMiddleware, async (req, res) => {
-  try {
-    const { userName, audioFiles } = req.body;
-
-    if (!audioFiles || audioFiles.length < 4) {
-      return res.status(400).json({ error: 'All 4 voice recordings are required' });
-    }
-
-    // Check if user already has a voice clone
-    const { data: user } = await supabase
-      .from('users')
-      .select('voice_id')
-      .eq('id', req.userId)
-      .single();
-
-    // If voice already exists — delete old one from ElevenLabs first
-    if (user?.voice_id) {
-      try {
-        await axios.delete(
-          `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
-          { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
-        );
-      } catch {
-        // Old voice deletion failed — continue anyway
-      }
-    }
-
-    // ── BUILD FORM DATA FOR ELEVENLABS ─────────────────
-    const form = new FormData();
-    form.append('name', `StandIn_${userName}_${req.userId}`);
-
-    // Add each audio recording as a file
-    audioFiles.forEach((base64Audio, index) => {
-      const buffer = Buffer.from(base64Audio, 'base64');
-      form.append('files', buffer, {
-        filename:    `sentence_${index + 1}.mp3`,
-        contentType: 'audio/mpeg',
-      });
-    });
-
-    // Labels for ElevenLabs (metadata)
-    form.append('labels', JSON.stringify({
-      userId:   req.userId,
-      userName: userName,
-      purpose:  'StandIn AI Voice Clone',
-    }));
-
-    // ── CALL ELEVENLABS API ───────────────────────────
-    const elevenResponse = await axios.post(
-      'https://api.elevenlabs.io/v1/voices/add',
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          'xi-api-key': process.env.ELEVENLABS_API_KEY,
-        },
-        timeout: 60000, // 60 second timeout for upload
-      }
-    );
-
-    const voiceId = elevenResponse.data.voice_id;
-
-    if (!voiceId) {
-      return res.status(500).json({ error: 'ElevenLabs did not return a voice ID' });
-    }
-
-    // ── SAVE VOICE ID TO DATABASE ─────────────────────
-    await supabase
-      .from('users')
-      .update({ voice_id: voiceId })
-      .eq('id', req.userId);
-
-    res.json({
-      success: true,
-      voiceId,
-      message: '✅ Voice clone created successfully!',
-    });
-
-  } catch (err) {
-    console.error('Voice clone error:', err?.response?.data || err.message);
-    const msg = err?.response?.data?.detail?.message || err.message || 'Voice clone failed';
-    res.status(500).json({ error: msg });
-  }
-});
-
-// ── GET USER'S VOICE STATUS ───────────────────────────
-router.get('/status', authMiddleware, async (req, res) => {
-  try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('voice_id')
-      .eq('id', req.userId)
-      .single();
-
-    if (!user?.voice_id) {
-      return res.json({ hasVoice: false });
-    }
-
-    // Check if voice still exists in ElevenLabs
-    try {
-      const response = await axios.get(
-        `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
-        { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
-      );
-      res.json({
-        hasVoice: true,
-        voiceId:  user.voice_id,
-        voiceName: response.data.name,
-      });
-    } catch {
-      // Voice no longer exists in ElevenLabs
-      res.json({ hasVoice: false });
-    }
-
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── DELETE VOICE CLONE ────────────────────────────────
-router.delete('/clone', authMiddleware, async (req, res) => {
-  try {
-    const { data: user } = await supabase
-      .from('users')
-      .select('voice_id')
-      .eq('id', req.userId)
-      .single();
-
-    if (user?.voice_id) {
-      await axios.delete(
-        `https://api.elevenlabs.io/v1/voices/${user.voice_id}`,
-        { headers: { 'xi-api-key': process.env.ELEVENLABS_API_KEY } }
-      );
-      await supabase
-        .from('users')
-        .update({ voice_id: null })
-        .eq('id', req.userId);
-    }
-
-    res.json({ success: true, message: 'Voice clone deleted' });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── USE VOICE IN MEETING (called internally by AI) ────
-// This is used by the Gemini AI service to speak via ElevenLabs
-router.post('/speak', authMiddleware, async (req, res) => {
-  try {
-    const { text, voiceId } = req.body;
-
-    if (!text) return res.status(400).json({ error: 'Text is required' });
-    if (!voiceId) return res.status(400).json({ error: 'Voice ID is required' });
-
-    // Call ElevenLabs text-to-speech
-    const response = await axios.post(
-      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`,
-      {
-        text,
-        model_id: 'eleven_multilingual_v2', // supports 29 languages
-        voice_settings: {
-          stability:        0.75, // consistent tone
-          similarity_boost: 0.85, // close to original voice
-          style:            0.5,  // natural expression
-          use_speaker_boost: true,
-        },
-      },
-      {
-        headers: {
-          'xi-api-key':   process.env.ELEVENLABS_API_KEY,
-          'Content-Type': 'application/json',
-          'Accept':       'audio/mpeg',
-        },
-        responseType: 'arraybuffer',
-        timeout:      30000,
-      }
-    );
-
-    // Return audio as base64 — mobile app plays it
-    const audioBase64 = Buffer.from(response.data).toString('base64');
-    res.json({
-      success:    true,
-      audio:      audioBase64,
-      mimeType:   'audio/mpeg',
-    });
-
-  } catch (err) {
-    console.error('Voice speak error:', err?.response?.data || err.message);
-    res.status(500).json({ error: 'Could not generate speech' });
-  }
-});
-
-module.exports = router;
 
 // ═══════════════════════════════════════════════════
 // START SERVER
