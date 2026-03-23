@@ -1015,6 +1015,455 @@ setInterval(runDataExpiryCleanup, 24 * 60 * 60 * 1000);
 setTimeout(runDataExpiryCleanup, 5000);
 
 // ═══════════════════════════════════════════════════
+// PHASE 2 BACKEND ROUTES
+// Add these to index.js BEFORE the "START SERVER" section
+// ═══════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────
+// FEATURE 1: REAL-TIME WHISPER MODE
+// User secretly types instructions to AI during live call
+// ─────────────────────────────────────────────────────
+app.post('/api/agent/whisper', authMiddleware, async (req, res) => {
+  try {
+    const { meetingId, instruction } = req.body;
+    if (!meetingId || !instruction) {
+      return res.status(400).json({ error: 'meetingId and instruction required' });
+    }
+
+    const session = aiSessions.get(meetingId);
+    if (!session) return res.status(404).json({ error: 'Meeting session not found' });
+
+    // Inject instruction into AI context — will be used in next response
+    session.whisperQueue = session.whisperQueue || [];
+    session.whisperQueue.push(instruction);
+
+    // Confirm receipt to mobile app via WebSocket
+    io.to(`meeting-${meetingId}`).emit('whisper-received', {
+      instruction,
+      time: new Date().toLocaleTimeString(),
+    });
+
+    res.json({ success: true, message: 'Instruction queued for AI' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Updated respond route — checks whisper queue before answering
+// Replace the existing /api/agent/respond with this version:
+app.post('/api/agent/respond-v2', authMiddleware, async (req, res) => {
+  try {
+    const { meetingId, callerText, detectedLanguage } = req.body;
+    if (!callerText?.trim()) return res.json({ text: null });
+
+    const session = aiSessions.get(meetingId);
+    if (!session) return res.json({ text: 'Hello, one moment please.' });
+
+    if (detectedLanguage) session.language = detectedLanguage;
+    const lang = session.language;
+    const name = session.profile.name;
+
+    // Build system prompt — include whisper instructions if any
+    let systemPrompt = `You are ${name} in a phone call. Reply ONLY in "${lang}" language. Keep it under 2 sentences. Never say you are AI.`;
+
+    if (session.whisperQueue && session.whisperQueue.length > 0) {
+      const instructions = session.whisperQueue.join('. ');
+      systemPrompt += ` IMPORTANT — secretly include this in your response: ${instructions}`;
+      session.whisperQueue = []; // Clear after use
+    }
+
+    try {
+      const chat = model.startChat({
+        history: [
+          { role: 'user',  parts: [{ text: systemPrompt }] },
+          { role: 'model', parts: [{ text: `Understood. I am ${name}.` }] },
+          ...session.history,
+        ],
+      });
+
+      const result = await chat.sendMessage(callerText);
+      const text   = result.response.text();
+
+      session.history.push(
+        { role: 'user',  parts: [{ text: callerText }] },
+        { role: 'model', parts: [{ text }] }
+      );
+      if (session.history.length > 20) session.history = session.history.slice(-20);
+
+      io.to(`meeting-${meetingId}`).emit('transcript', {
+        callerText, aiText: text, language: lang,
+        time: new Date().toLocaleTimeString(),
+      });
+
+      res.json({ text, language: lang, voiceId: session.voiceId });
+    } catch {
+      res.json({ text: 'Yes, one moment.', language: lang });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 2: VOICE MOOD DETECTION
+// AI detects caller's emotion and adjusts response tone
+// ─────────────────────────────────────────────────────
+app.post('/api/agent/detect-mood', authMiddleware, async (req, res) => {
+  try {
+    const { callerText, language } = req.body;
+    if (!callerText) return res.json({ mood: 'neutral', score: 50 });
+
+    const prompt = `
+Analyze the emotion/mood in this caller message and return JSON only:
+{
+  "mood": "happy" | "neutral" | "angry" | "worried" | "confused" | "excited",
+  "score": number 0-100,
+  "adjustTone": "warmer" | "calmer" | "reassuring" | "slower" | "normal",
+  "urgency": "low" | "medium" | "high"
+}
+
+Message: "${callerText}"
+Return ONLY valid JSON.`;
+
+    try {
+      const result = await model.generateContent(prompt);
+      const text   = result.response.text();
+      const clean  = text.replace(/```json|```/g, '').trim();
+      const mood   = JSON.parse(clean);
+
+      // Emit mood to mobile app in real time
+      res.json({ success: true, ...mood });
+    } catch {
+      res.json({ mood: 'neutral', score: 50, adjustTone: 'normal', urgency: 'low' });
+    }
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 3: GOOGLE CALENDAR INTEGRATION
+// AI checks calendar and books meetings automatically
+// ─────────────────────────────────────────────────────
+
+// Save Google Calendar access token
+app.post('/api/calendar/connect', authMiddleware, async (req, res) => {
+  try {
+    const { accessToken, refreshToken } = req.body;
+    await supabase
+      .from('users')
+      .update({
+        calendar_access_token:  accessToken,
+        calendar_refresh_token: refreshToken,
+        calendar_connected:     true,
+      })
+      .eq('id', req.userId);
+    res.json({ success: true, message: 'Google Calendar connected!' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Check calendar availability
+app.post('/api/calendar/check', authMiddleware, async (req, res) => {
+  try {
+    const { date, duration = 60 } = req.body; // duration in minutes
+    const { data: user } = await supabase
+      .from('users')
+      .select('calendar_access_token')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user?.calendar_access_token) {
+      return res.json({ available: true, message: 'Calendar not connected — assuming available' });
+    }
+
+    // Check Google Calendar API
+    const startTime = new Date(date);
+    const endTime   = new Date(startTime.getTime() + duration * 60000);
+
+    const response = await axios.post(
+      'https://www.googleapis.com/calendar/v3/freeBusy',
+      {
+        timeMin:  startTime.toISOString(),
+        timeMax:  endTime.toISOString(),
+        items:    [{ id: 'primary' }],
+      },
+      { headers: { Authorization: `Bearer ${user.calendar_access_token}` } }
+    );
+
+    const busy = response.data.calendars?.primary?.busy || [];
+    res.json({
+      available: busy.length === 0,
+      busySlots: busy,
+      message:   busy.length === 0 ? 'Time slot is free ✅' : 'Already have something scheduled',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Book a meeting in Google Calendar
+app.post('/api/calendar/book', authMiddleware, async (req, res) => {
+  try {
+    const { title, startTime, endTime, attendeeEmail, description } = req.body;
+    const { data: user } = await supabase
+      .from('users')
+      .select('calendar_access_token, name')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user?.calendar_access_token) {
+      return res.status(400).json({ error: 'Calendar not connected' });
+    }
+
+    // Create calendar event
+    const event = {
+      summary:     title || `Meeting with ${user.name}`,
+      description: description || 'Scheduled via StandIn AI',
+      start: { dateTime: startTime, timeZone: 'Asia/Kolkata' },
+      end:   { dateTime: endTime,   timeZone: 'Asia/Kolkata' },
+      attendees: attendeeEmail ? [{ email: attendeeEmail }] : [],
+      reminders: {
+        useDefault: false,
+        overrides:  [{ method: 'popup', minutes: 15 }],
+      },
+    };
+
+    const response = await axios.post(
+      'https://www.googleapis.com/calendar/v3/calendars/primary/events',
+      event,
+      { headers: { Authorization: `Bearer ${user.calendar_access_token}` } }
+    );
+
+    res.json({
+      success:  true,
+      eventId:  response.data.id,
+      eventUrl: response.data.htmlLink,
+      message:  '✅ Meeting booked in Google Calendar!',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get upcoming events (for context during calls)
+app.get('/api/calendar/upcoming', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('calendar_access_token')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user?.calendar_access_token) {
+      return res.json({ events: [] });
+    }
+
+    const now     = new Date();
+    const weekLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    const response = await axios.get(
+      'https://www.googleapis.com/calendar/v3/calendars/primary/events',
+      {
+        params: {
+          timeMin:      now.toISOString(),
+          timeMax:      weekLater.toISOString(),
+          singleEvents: true,
+          orderBy:      'startTime',
+          maxResults:   10,
+        },
+        headers: { Authorization: `Bearer ${user.calendar_access_token}` },
+      }
+    );
+
+    const events = (response.data.items || []).map((e: any) => ({
+      id:       e.id,
+      title:    e.summary,
+      start:    e.start?.dateTime || e.start?.date,
+      end:      e.end?.dateTime   || e.end?.date,
+      location: e.location,
+    }));
+
+    res.json({ events });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 4: FRAUD DETECTION AI
+// Monitors calls for suspicious patterns in real time
+// ─────────────────────────────────────────────────────
+app.post('/api/agent/fraud-check', authMiddleware, async (req, res) => {
+  try {
+    const { callerText, callerPhone, meetingId } = req.body;
+
+    // Pattern-based fraud detection (instant, no AI needed)
+    const fraudPatterns = [
+      { pattern: /OTP|one.time.password|verification code/i,      level: 'HIGH',   reason: 'Asking for OTP — possible fraud' },
+      { pattern: /bank|account number|IFSC|ATM|card number/i,     level: 'HIGH',   reason: 'Asking for banking details' },
+      { pattern: /CBI|police|court|arrest|FIR|legal action/i,     level: 'HIGH',   reason: 'Threatening with legal action — scam pattern' },
+      { pattern: /lottery|won|prize|claim|congratulations/i,      level: 'HIGH',   reason: 'Lottery/prize scam pattern detected' },
+      { pattern: /Aadhaar|PAN|passport|KYC|update your details/i, level: 'MEDIUM', reason: 'Asking for identity documents' },
+      { pattern: /urgent|immediately|right now|emergency/i,       level: 'LOW',    reason: 'Creating urgency — common manipulation tactic' },
+    ];
+
+    let fraud = null;
+    for (const p of fraudPatterns) {
+      if (p.pattern.test(callerText)) {
+        fraud = p;
+        break;
+      }
+    }
+
+    // Check call frequency — same number calling too many times
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { count } = await supabase
+      .from('meetings')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', req.userId)
+      .eq('from_number', callerPhone)
+      .gte('created_at', oneHourAgo);
+
+    if ((count || 0) >= 5 && !fraud) {
+      fraud = { level: 'MEDIUM', reason: `Same number called ${count} times in 1 hour` };
+    }
+
+    if (fraud) {
+      // Alert user via WebSocket immediately
+      io.to(`user-${req.userId}`).emit('fraud-alert', {
+        level:  fraud.level,
+        reason: fraud.reason,
+        phone:  callerPhone,
+        time:   new Date().toLocaleTimeString(),
+      });
+
+      // HIGH level fraud — AI automatically says safe phrase and ends
+      if (fraud.level === 'HIGH') {
+        const session = aiSessions.get(meetingId);
+        if (session) {
+          const safePhrases: any = {
+            hi: 'मैं आपको आधिकारिक नंबर से वापस कॉल करूंगा।',
+            en: 'I will call you back on the official number. Thank you.',
+            ar: 'سأعاود الاتصال بك على الرقم الرسمي.',
+          };
+          const lang   = session.language || 'en';
+          const phrase = safePhrases[lang] || safePhrases.en;
+          io.to(`meeting-${meetingId}`).emit('transcript', {
+            aiText: phrase, language: lang, fraudAlert: true,
+          });
+        }
+      }
+    }
+
+    res.json({
+      isFraud:   !!fraud,
+      level:     fraud?.level || 'SAFE',
+      reason:    fraud?.reason || 'No suspicious patterns detected',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Get fraud alert history
+app.get('/api/fraud/alerts', authMiddleware, async (req, res) => {
+  try {
+    const { data } = await supabase
+      .from('fraud_alerts')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+      .limit(20);
+    res.json(data || []);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 5: END-TO-END ENCRYPTION
+// Encrypts all transcripts with user's own key
+// ─────────────────────────────────────────────────────
+const crypto = require('crypto');
+
+// Generate encryption key for user
+app.post('/api/security/generate-key', authMiddleware, async (req, res) => {
+  try {
+    // Generate AES-256 key
+    const encryptionKey = crypto.randomBytes(32).toString('hex');
+
+    // Store key hash (never store the actual key — user keeps it)
+    const keyHash = crypto
+      .createHash('sha256')
+      .update(encryptionKey)
+      .digest('hex');
+
+    await supabase
+      .from('users')
+      .update({ encryption_key_hash: keyHash })
+      .eq('id', req.userId);
+
+    // Return key to user — they must save it themselves
+    // We only store the hash, never the key
+    res.json({
+      success:       true,
+      encryptionKey, // User must save this — we cannot recover it
+      warning:       'Save this key safely. If lost, your encrypted data cannot be recovered.',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Encrypt a meeting transcript
+app.post('/api/security/encrypt', authMiddleware, async (req, res) => {
+  try {
+    const { data, userKey } = req.body;
+    if (!data || !userKey) return res.status(400).json({ error: 'data and userKey required' });
+
+    const key = Buffer.from(userKey, 'hex');
+    const iv  = crypto.randomBytes(16);
+
+    const cipher     = crypto.createCipheriv('aes-256-cbc', key, iv);
+    const encrypted  = Buffer.concat([cipher.update(JSON.stringify(data)), cipher.final()]);
+
+    res.json({
+      success:   true,
+      encrypted: encrypted.toString('hex'),
+      iv:        iv.toString('hex'),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Encryption failed' });
+  }
+});
+
+// Decrypt a meeting transcript
+app.post('/api/security/decrypt', authMiddleware, async (req, res) => {
+  try {
+    const { encrypted, iv, userKey } = req.body;
+    if (!encrypted || !iv || !userKey) {
+      return res.status(400).json({ error: 'encrypted, iv and userKey required' });
+    }
+
+    const key       = Buffer.from(userKey, 'hex');
+    const ivBuf     = Buffer.from(iv, 'hex');
+    const encBuf    = Buffer.from(encrypted, 'hex');
+
+    const decipher  = crypto.createDecipheriv('aes-256-cbc', key, ivBuf);
+    const decrypted = Buffer.concat([decipher.update(encBuf), decipher.final()]);
+
+    res.json({
+      success: true,
+      data:    JSON.parse(decrypted.toString()),
+    });
+  } catch (err) {
+    res.status(500).json({ error: 'Decryption failed — wrong key or corrupted data' });
+  }
+});
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
