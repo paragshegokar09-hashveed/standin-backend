@@ -591,7 +591,7 @@ function detectLanguage(phone) {
 
 // POST /api/voice/clone
 // Body: { userName: string, audioFiles: string[] } (base64 encoded)
-router.post('/clone', authMiddleware, async (req, res) => {
+app.post('/api/voice/clone', authMiddleware, async (req, res) => {
   try {
     const { userName, audioFiles } = req.body;
 
@@ -677,7 +677,7 @@ router.post('/clone', authMiddleware, async (req, res) => {
 });
 
 // ── GET USER'S VOICE STATUS ───────────────────────────
-router.get('/status', authMiddleware, async (req, res) => {
+app.get('/api/voice/status', authMiddleware, async (req, res) => {
   try {
     const { data: user } = await supabase
       .from('users')
@@ -711,7 +711,7 @@ router.get('/status', authMiddleware, async (req, res) => {
 });
 
 // ── DELETE VOICE CLONE ────────────────────────────────
-router.delete('/clone', authMiddleware, async (req, res) => {
+app.delete('/api/voice/clone', authMiddleware, async (req, res) => {
   try {
     const { data: user } = await supabase
       .from('users')
@@ -738,7 +738,7 @@ router.delete('/clone', authMiddleware, async (req, res) => {
 
 // ── USE VOICE IN MEETING (called internally by AI) ────
 // This is used by the Gemini AI service to speak via ElevenLabs
-router.post('/speak', authMiddleware, async (req, res) => {
+app.post('/api/voice/speak', authMiddleware, async (req, res) => {
   try {
     const { text, voiceId } = req.body;
 
@@ -783,7 +783,7 @@ router.post('/speak', authMiddleware, async (req, res) => {
   }
 });
 
-// (merged-removed): module.exports = router;
+// (merged-removed): // routes registered directly on app
 
 
 // ══════════════════════════════════════════════════
