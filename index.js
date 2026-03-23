@@ -12,6 +12,7 @@ const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 const axios      = require('axios');
 const FormData   = require('form-data');
+const crypto     = require('crypto');
 
 // ── SETUP ─────────────────────────────────────────
 const app    = express();
@@ -573,14 +574,8 @@ function detectLanguage(phone) {
 // POST /api/voice/clone
 // Receives 4 base64 audio recordings → sends to ElevenLabs → returns voiceId
 
-const express    = require('express');
-const router     = express.Router();
-const axios      = require('axios');
-const FormData   = require('form-data');
-const { createClient } = require('@supabase/supabase-js');
-const authMiddleware = require('../middleware/auth');
 
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+// (removed duplicate) const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 
 // ── ADD TO index.js ──────────────────────────────────
 // const voiceRoutes = require('./routes/voice');
@@ -1053,7 +1048,6 @@ app.post('/api/security/pin', authMiddleware, async (req, res) => {
     }
 
     // Hash the PIN before storing
-    const crypto = require('crypto');
     const hashedPin = crypto
       .createHmac('sha256', process.env.JWT_SECRET)
       .update(pin)
@@ -1074,7 +1068,6 @@ app.post('/api/security/pin', authMiddleware, async (req, res) => {
 app.post('/api/security/verify-pin', authMiddleware, async (req, res) => {
   try {
     const { pin } = req.body;
-    const crypto = require('crypto');
     const hashedPin = crypto
       .createHmac('sha256', process.env.JWT_SECRET)
       .update(pin)
@@ -1614,7 +1607,6 @@ app.get('/api/fraud/alerts', authMiddleware, async (req, res) => {
 // FEATURE 5: END-TO-END ENCRYPTION
 // Encrypts all transcripts with user's own key
 // ─────────────────────────────────────────────────────
-const crypto = require('crypto');
 
 // Generate encryption key for user
 app.post('/api/security/generate-key', authMiddleware, async (req, res) => {
