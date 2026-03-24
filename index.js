@@ -2225,6 +2225,179 @@ app.post('/api/agent/end-v3', authMiddleware, async (req, res) => {
   }
 });
 
+// ═══════════════════════════════════════════════════
+// PHASE 3 BACKEND ROUTES — Clean Version
+// Features: AI Personality + Conversation Watermarking
+// Paste into index.js BEFORE "START SERVER" section
+// ═══════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────
+// FEATURE 1: AI PERSONALITY CALIBRATION
+// ─────────────────────────────────────────────────────
+
+app.post('/api/personality/save', authMiddleware, async (req, res) => {
+  try {
+    const { formalityLevel, speakingSpeed, useHonorific, commonPhrases,
+            expertTopics, avoidTopics, responseLength, personalityType, languageStyle } = req.body;
+    await supabase.from('users').update({
+      personality_formality: formalityLevel,
+      personality_speed:     speakingSpeed,
+      personality_honorific: useHonorific,
+      personality_phrases:   JSON.stringify(commonPhrases || []),
+      personality_expert:    JSON.stringify(expertTopics  || []),
+      personality_avoid:     JSON.stringify(avoidTopics   || []),
+      personality_length:    responseLength,
+      personality_type:      personalityType,
+      personality_language:  languageStyle,
+    }).eq('id', req.userId);
+    res.json({ success: true, message: 'Personality saved!' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/personality', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('personality_formality,personality_speed,personality_honorific,personality_phrases,personality_expert,personality_avoid,personality_length,personality_type,personality_language')
+      .eq('id', req.userId).single();
+    res.json({
+      formalityLevel:  user?.personality_formality  || 7,
+      speakingSpeed:   user?.personality_speed       || 'normal',
+      useHonorific:    user?.personality_honorific   || false,
+      commonPhrases:   JSON.parse(user?.personality_phrases || '[]'),
+      expertTopics:    JSON.parse(user?.personality_expert  || '[]'),
+      avoidTopics:     JSON.parse(user?.personality_avoid   || '[]'),
+      responseLength:  user?.personality_length      || 'medium',
+      personalityType: user?.personality_type        || 'professional',
+      languageStyle:   user?.personality_language    || 'formal_english',
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+function buildPersonalityPrompt(user, callerLang) {
+  const formality = user.personality_formality || 7;
+  const phrases   = JSON.parse(user.personality_phrases || '[]');
+  const expert    = JSON.parse(user.personality_expert  || '[]');
+  const avoid     = JSON.parse(user.personality_avoid   || '[]');
+  const type      = user.personality_type    || 'professional';
+  const length    = user.personality_length  || 'medium';
+  const honorific = user.personality_honorific || false;
+  let p = `You are ${user.name} on a phone call. Reply ONLY in "${callerLang}" language. `;
+  p += `Formality: ${formality}/10. Personality: ${type}. `;
+  p += `Response length: ${length === 'short' ? '1 sentence max' : length === 'detailed' ? '2-3 sentences' : '1-2 sentences'}. `;
+  if (honorific)      p += `Address caller as Sir or Madam. `;
+  if (phrases.length) p += `Use phrases like: ${phrases.join(', ')}. `;
+  if (expert.length)  p += `You are expert in: ${expert.join(', ')}. `;
+  if (avoid.length)   p += `Never discuss: ${avoid.join(', ')}, politely redirect. `;
+  p += `Never say you are AI.`;
+  return p;
+}
+
+app.post('/api/agent/respond-personality', authMiddleware, async (req, res) => {
+  try {
+    const { meetingId, callerText, detectedLanguage } = req.body;
+    if (!callerText?.trim()) return res.json({ text: null });
+    const session = aiSessions.get(meetingId);
+    if (!session) return res.json({ text: 'Hello, one moment.' });
+    if (detectedLanguage) session.language = detectedLanguage;
+    const lang = session.language || 'en';
+    const { data: user } = await supabase.from('users').select('*').eq('id', req.userId).single();
+    let systemPrompt = buildPersonalityPrompt(user, lang);
+    if (session.whisperQueue && session.whisperQueue.length > 0) {
+      systemPrompt += ` IMPORTANT: ${session.whisperQueue.join('. ')}`;
+      session.whisperQueue = [];
+    }
+    try {
+      const chat = model.startChat({
+        history: [
+          { role: 'user',  parts: [{ text: systemPrompt }] },
+          { role: 'model', parts: [{ text: `Understood. I am ${user?.name}.` }] },
+          ...session.history,
+        ],
+      });
+      const result = await chat.sendMessage(callerText);
+      const text   = result.response.text();
+      session.history.push(
+        { role: 'user',  parts: [{ text: callerText }] },
+        { role: 'model', parts: [{ text }] }
+      );
+      if (session.history.length > 20) session.history = session.history.slice(-20);
+      io.to(`meeting-${meetingId}`).emit('transcript', {
+        callerText, aiText: text, language: lang,
+        time: new Date().toLocaleTimeString(),
+      });
+      res.json({ text, language: lang, voiceId: session.voiceId });
+    } catch {
+      res.json({ text: 'Yes, one moment please.', language: lang });
+    }
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────
+// FEATURE 2: CONVERSATION WATERMARKING
+// ─────────────────────────────────────────────────────
+
+function generateWatermark(userId, meetingId, timestamp) {
+  const data = `${userId}:${meetingId}:${timestamp}`;
+  return crypto.createHmac('sha256', process.env.JWT_SECRET)
+    .update(data).digest('hex').slice(0, 16);
+}
+
+app.post('/api/watermark/verify', authMiddleware, async (req, res) => {
+  try {
+    const { text, meetingId, timestamp } = req.body;
+    const { data: user } = await supabase.from('users').select('id').eq('id', req.userId).single();
+    const expectedWm = generateWatermark(user.id, meetingId, timestamp);
+    const zwChars    = text.match(/[\u200C\u200D]/g) || [];
+    const extracted  = zwChars.map(c => c === '\u200D' ? 'a' : '0').join('');
+    const match      = extracted.includes(expectedWm.slice(0, 8));
+    res.json({
+      verified:  match,
+      watermark: expectedWm,
+      message:   match ? '✅ Verified — authentic conversation' : '❌ Watermark not found',
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/watermark/log/:meetingId', authMiddleware, async (req, res) => {
+  try {
+    const { data: meeting } = await supabase
+      .from('meetings')
+      .select('watermark_data,created_at,from_number')
+      .eq('id', req.params.meetingId)
+      .eq('user_id', req.userId).single();
+    if (!meeting) return res.status(404).json({ error: 'Meeting not found' });
+    res.json({ meetingId: req.params.meetingId, watermarkData: meeting.watermark_data, timestamp: meeting.created_at, caller: meeting.from_number });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.post('/api/agent/end-v3', authMiddleware, async (req, res) => {
+  try {
+    const { meetingId, fromNumber, duration } = req.body;
+    const session = aiSessions.get(meetingId);
+    let summary = 'Meeting completed.', duration_ = duration || 0;
+    if (session && session.history.length >= 2) {
+      const transcript = session.history
+        .map(m => `${m.role === 'user' ? 'Caller' : 'AI'}: ${m.parts[0].text}`).join('\n');
+      try {
+        const r = await model.generateContent(`Summarize this phone call in 3 sentences. List action items.\n\n${transcript}`);
+        summary   = r.response.text();
+        duration_ = Math.floor((Date.now() - session.startTime) / 60000);
+      } catch {}
+    }
+    aiSessions.delete(meetingId);
+    const timestamp = Date.now().toString();
+    const watermark = generateWatermark(req.userId, meetingId, timestamp);
+    await supabase.from('meetings').insert({
+      user_id: req.userId, from_number: fromNumber || 'Unknown',
+      language: session?.language || 'en', summary, duration: duration_, status: 'completed',
+      watermark_data: JSON.stringify({ watermark, timestamp }),
+    });
+    io.to(`meeting-${meetingId}`).emit('meeting-ended', { summary });
+    res.json({ summary, duration: duration_, watermark });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
 
 // ═══════════════════════════════════════════════════
 // START SERVER
