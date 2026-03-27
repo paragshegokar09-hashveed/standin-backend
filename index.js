@@ -2397,7 +2397,331 @@ app.post('/api/agent/end-v3', authMiddleware, async (req, res) => {
     res.json({ summary, duration: duration_, watermark });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
+// ═══════════════════════════════════════════════════
+// GMAIL SUMMARY ROUTES
+// Sends meeting summary to user's Gmail after every call
+// Uses Gmail API — Google OAuth already configured
+// Paste into index.js BEFORE "START SERVER" section
+// ═══════════════════════════════════════════════════
 
+// ─────────────────────────────────────────────────────
+// GMAIL SUMMARY — Core Function
+// Called automatically when meeting ends
+// ─────────────────────────────────────────────────────
+
+async function sendGmailSummary(accessToken, toEmail, callerPhone, summary, duration, sentiment, actionItems) {
+  try {
+    const sentimentEmoji = {
+      positive: '😊', neutral: '😐', angry:   '😠',
+      worried:  '😟', confused: '🤔', excited: '🤩',
+    }[sentiment] || '😐';
+
+    const now        = new Date();
+    const timeStr    = now.toLocaleString('en-IN', {
+      weekday: 'short', month: 'short', day: 'numeric',
+      hour: '2-digit', minute: '2-digit',
+    });
+
+    // Format action items
+    const actionsHtml = actionItems && actionItems.length > 0
+      ? actionItems.map(a => `<li style="margin:4px 0;color:#374151;">${a}</li>`).join('')
+      : '<li style="color:#6B7280;">No specific action items detected</li>';
+
+    const actionsText = actionItems && actionItems.length > 0
+      ? actionItems.map(a => `• ${a}`).join('\n')
+      : '• No specific action items detected';
+
+    // Beautiful HTML email
+    const htmlBody = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"></head>
+<body style="margin:0;padding:0;background:#f3f4f6;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
+  <table width="100%" cellpadding="0" cellspacing="0">
+    <tr><td align="center" style="padding:24px 16px;">
+      <table width="560" cellpadding="0" cellspacing="0" style="background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(0,0,0,0.08);">
+
+        <!-- Header -->
+        <tr><td style="background:linear-gradient(135deg,#7C3AED,#00E5CC);padding:28px 32px;">
+          <table width="100%">
+            <tr>
+              <td>
+                <p style="margin:0;color:rgba(255,255,255,0.8);font-size:12px;letter-spacing:1px;text-transform:uppercase;">StandIn AI</p>
+                <h1 style="margin:6px 0 0;color:#ffffff;font-size:22px;font-weight:700;">Meeting Summary</h1>
+              </td>
+              <td align="right">
+                <span style="background:rgba(255,255,255,0.2);color:#fff;padding:6px 14px;border-radius:20px;font-size:12px;font-weight:600;">📋 AUTO SUMMARY</span>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+
+        <!-- Meta info -->
+        <tr><td style="padding:24px 32px 0;">
+          <table width="100%" style="background:#f9fafb;border-radius:12px;overflow:hidden;">
+            <tr>
+              <td style="padding:14px 16px;border-bottom:1px solid #e5e7eb;">
+                <span style="color:#6B7280;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Caller</span><br>
+                <span style="color:#111827;font-size:15px;font-weight:600;margin-top:2px;display:block;">${callerPhone}</span>
+              </td>
+              <td style="padding:14px 16px;border-bottom:1px solid #e5e7eb;border-left:1px solid #e5e7eb;">
+                <span style="color:#6B7280;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Duration</span><br>
+                <span style="color:#111827;font-size:15px;font-weight:600;margin-top:2px;display:block;">⏱️ ${duration} minutes</span>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:14px 16px;">
+                <span style="color:#6B7280;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Sentiment</span><br>
+                <span style="color:#111827;font-size:15px;font-weight:600;margin-top:2px;display:block;">${sentimentEmoji} ${sentiment || 'Neutral'}</span>
+              </td>
+              <td style="padding:14px 16px;border-left:1px solid #e5e7eb;">
+                <span style="color:#6B7280;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:0.5px;">Time</span><br>
+                <span style="color:#111827;font-size:14px;font-weight:600;margin-top:2px;display:block;">📅 ${timeStr}</span>
+              </td>
+            </tr>
+          </table>
+        </td></tr>
+
+        <!-- Summary -->
+        <tr><td style="padding:24px 32px 0;">
+          <h2 style="margin:0 0 12px;color:#111827;font-size:16px;font-weight:700;">📝 Summary</h2>
+          <p style="margin:0;color:#374151;font-size:14px;line-height:1.7;background:#f9fafb;padding:16px;border-radius:10px;border-left:4px solid #7C3AED;">${summary}</p>
+        </td></tr>
+
+        <!-- Action Items -->
+        <tr><td style="padding:20px 32px 0;">
+          <h2 style="margin:0 0 12px;color:#111827;font-size:16px;font-weight:700;">⚡ Action Items</h2>
+          <ul style="margin:0;padding:0 0 0 20px;background:#f9fafb;border-radius:10px;border-left:4px solid #00E5CC;padding:16px 16px 16px 36px;">
+            ${actionsHtml}
+          </ul>
+        </td></tr>
+
+        <!-- Footer -->
+        <tr><td style="padding:24px 32px;text-align:center;border-top:1px solid #e5e7eb;margin-top:24px;">
+          <p style="margin:0;color:#9CA3AF;font-size:12px;">
+            Sent automatically by <strong style="color:#7C3AED;">StandIn AI</strong> • Your AI meeting assistant
+          </p>
+        </td></tr>
+
+      </table>
+    </td></tr>
+  </table>
+</body>
+</html>`;
+
+    // Plain text fallback
+    const textBody =
+      `STANDIN AI — MEETING SUMMARY\n` +
+      `${'─'.repeat(40)}\n` +
+      `Caller:    ${callerPhone}\n` +
+      `Duration:  ${duration} minutes\n` +
+      `Sentiment: ${sentimentEmoji} ${sentiment || 'Neutral'}\n` +
+      `Time:      ${timeStr}\n\n` +
+      `SUMMARY\n${summary}\n\n` +
+      `ACTION ITEMS\n${actionsText}\n\n` +
+      `─────────────────────────────\n` +
+      `Sent automatically by StandIn AI`;
+
+    // Build RFC 2822 email
+    const subject  = `📋 StandIn AI — Meeting Summary | ${callerPhone} | ${timeStr}`;
+    const message  =
+      `To: ${toEmail}\r\n` +
+      `Subject: ${subject}\r\n` +
+      `MIME-Version: 1.0\r\n` +
+      `Content-Type: multipart/alternative; boundary="boundary_standin"\r\n\r\n` +
+      `--boundary_standin\r\n` +
+      `Content-Type: text/plain; charset=UTF-8\r\n\r\n` +
+      `${textBody}\r\n\r\n` +
+      `--boundary_standin\r\n` +
+      `Content-Type: text/html; charset=UTF-8\r\n\r\n` +
+      `${htmlBody}\r\n\r\n` +
+      `--boundary_standin--`;
+
+    // Base64 encode for Gmail API
+    const encoded = Buffer.from(message).toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    // Send via Gmail API
+    await axios.post(
+      'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+      { raw: encoded },
+      {
+        headers: {
+          Authorization:  `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        timeout: 15000,
+      }
+    );
+
+    console.log('✅ Gmail summary sent to:', toEmail);
+    return true;
+  } catch (err) {
+    console.error('Gmail send error:', err?.response?.data || err.message);
+    return false;
+  }
+}
+
+// ─────────────────────────────────────────────────────
+// GMAIL SETTINGS — Save user preferences
+// ─────────────────────────────────────────────────────
+
+// Save Gmail settings
+app.post('/api/gmail/settings', authMiddleware, async (req, res) => {
+  try {
+    const { enabled, emailAddress } = req.body;
+    await supabase.from('users').update({
+      gmail_summary_enabled: enabled,
+      gmail_summary_email:   emailAddress,
+    }).eq('id', req.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get Gmail settings
+app.get('/api/gmail/settings', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('gmail_summary_enabled,gmail_summary_email,google_access_token,name')
+      .eq('id', req.userId).single();
+    res.json({
+      enabled:        user?.gmail_summary_enabled || false,
+      emailAddress:   user?.gmail_summary_email   || '',
+      calendarLinked: !!user?.google_access_token,
+      name:           user?.name || '',
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Send test Gmail summary
+app.post('/api/gmail/test', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('google_access_token,gmail_summary_email,name')
+      .eq('id', req.userId).single();
+
+    if (!user?.google_access_token) {
+      return res.status(400).json({ error: 'Google account not connected. Connect Calendar first.' });
+    }
+
+    const toEmail = user.gmail_summary_email || req.body.emailAddress;
+    if (!toEmail) {
+      return res.status(400).json({ error: 'No email address configured.' });
+    }
+
+    const sent = await sendGmailSummary(
+      user.google_access_token,
+      toEmail,
+      '+91 00000 00000 (Test Caller)',
+      'This is a test summary from StandIn AI. Your Gmail notifications are working correctly! When a real meeting ends, a full summary like this will be sent automatically to your inbox.',
+      5,
+      'positive',
+      ['Review the meeting summary feature', 'Configure your preferences', 'Build your first APK']
+    );
+
+    if (sent) {
+      res.json({ success: true, message: '✅ Test email sent! Check your inbox.' });
+    } else {
+      res.status(500).json({ error: 'Failed to send test email. Check your Google connection.' });
+    }
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────
+// UPDATED agent/end — sends Gmail summary after every call
+// This replaces the old /api/agent/end route
+// ─────────────────────────────────────────────────────
+
+app.post('/api/agent/end-with-gmail', authMiddleware, async (req, res) => {
+  try {
+    const { meetingId, fromNumber, duration } = req.body;
+    const session = aiSessions.get(meetingId);
+
+    let summary     = 'Meeting completed successfully.';
+    let sentiment   = 'neutral';
+    let actionItems = [];
+    let duration_   = duration || 0;
+
+    if (session && session.history.length >= 2) {
+      const transcript = session.history
+        .map(m => `${m.role === 'user' ? 'Caller' : 'AI'}: ${m.parts[0].text}`)
+        .join('\n');
+
+      // Generate summary + action items
+      try {
+        const sumResult = await model.generateContent(
+          `Analyze this phone call and respond in JSON only:
+          {
+            "summary": "3 sentence summary of the call",
+            "sentiment": "positive|neutral|angry|worried|confused",
+            "actionItems": ["action 1", "action 2", "action 3"]
+          }
+          
+          Call transcript:
+          ${transcript}`
+        );
+
+        const raw  = sumResult.response.text().replace(/```json|```/g, '').trim();
+        const data = JSON.parse(raw);
+        summary     = data.summary     || summary;
+        sentiment   = data.sentiment   || sentiment;
+        actionItems = data.actionItems || [];
+        duration_   = Math.floor((Date.now() - session.startTime) / 60000);
+      } catch {}
+    }
+
+    aiSessions.delete(meetingId);
+
+    // Generate watermark
+    const timestamp = Date.now().toString();
+    const watermark = crypto
+      .createHmac('sha256', process.env.JWT_SECRET)
+      .update(`${req.userId}:${meetingId}:${timestamp}`)
+      .digest('hex').slice(0, 16);
+
+    // Save to database
+    await supabase.from('meetings').insert({
+      user_id:        req.userId,
+      from_number:    fromNumber || 'Unknown',
+      language:       session?.language || 'en',
+      summary,
+      duration:       duration_,
+      status:         'completed',
+      watermark_data: JSON.stringify({ watermark, timestamp }),
+    });
+
+    io.to(`meeting-${meetingId}`).emit('meeting-ended', { summary });
+
+    // Send Gmail summary if enabled
+    const { data: user } = await supabase
+      .from('users')
+      .select('gmail_summary_enabled,gmail_summary_email,google_access_token')
+      .eq('id', req.userId).single();
+
+    if (user?.gmail_summary_enabled && user?.google_access_token) {
+      const toEmail = user.gmail_summary_email;
+      if (toEmail) {
+        // Send async — do not block response
+        sendGmailSummary(
+          user.google_access_token,
+          toEmail,
+          fromNumber || 'Unknown',
+          summary,
+          duration_,
+          sentiment,
+          actionItems
+        ).catch(err => console.error('Gmail async error:', err.message));
+      }
+    }
+
+    res.json({ summary, duration: duration_, sentiment, actionItems, watermark });
+  } catch (err) {
+    console.error('End with gmail error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // ═══════════════════════════════════════════════════
 // START SERVER
