@@ -2724,6 +2724,655 @@ app.post('/api/agent/end-with-gmail', authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
+// TWILIO INTEGRATION — Complete Phone Call Bridge
+// Paste into index.js BEFORE "START SERVER" section
+//
+// How it works:
+// 1. User gets a Twilio phone number
+// 2. Caller dials Twilio number
+// 3. Twilio calls /api/twilio/incoming webhook
+// 4. Backend checks if AI is ON for that user
+// 5. If ON → AI answers with cloned voice
+// 6. If OFF → forwards to user's real phone
+// ═══════════════════════════════════════════════════
+
+const twilio = require('twilio');
+
+// ─────────────────────────────────────────────────────
+// HELPER — Build TwiML response
+// TwiML = Twilio Markup Language (like HTML for calls)
+// ─────────────────────────────────────────────────────
+
+function buildGreetingTwiML(greetingAudioUrl, gatherUrl) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${greetingAudioUrl}</Play>
+  <Gather input="speech" action="${gatherUrl}" method="POST"
+    speechTimeout="auto" speechModel="phone_call"
+    language="en-IN" timeout="5">
+  </Gather>
+  <Redirect>${gatherUrl}?retry=true</Redirect>
+</Response>`;
+}
+
+function buildSpeakTwiML(audioUrl, gatherUrl) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${audioUrl}</Play>
+  <Gather input="speech" action="${gatherUrl}" method="POST"
+    speechTimeout="auto" speechModel="phone_call"
+    language="en-IN" timeout="5">
+  </Gather>
+  <Redirect>${gatherUrl}?retry=true</Redirect>
+</Response>`;
+}
+
+function buildForwardTwiML(realPhone) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Dial timeout="30" callerId="${process.env.TWILIO_PHONE_NUMBER}">
+    <Number>${realPhone}</Number>
+  </Dial>
+</Response>`;
+}
+
+function buildHoldTwiML() {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play loop="3">https://api.twilio.com/cowbell.mp3</Play>
+  <Say>Please hold while I transfer your call.</Say>
+</Response>`;
+}
+
+function buildEndTwiML() {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Thank you for calling. Goodbye.</Say>
+  <Hangup/>
+</Response>`;
+}
+
+// ─────────────────────────────────────────────────────
+// HELPER — Generate AI voice audio URL via ElevenLabs
+// Returns a publicly accessible audio URL
+// ─────────────────────────────────────────────────────
+
+async function generateVoiceAudio(text, voiceId) {
+  try {
+    const response = await axios.post(
+      `https://api.elevenlabs.io/v1/text-to-speech/${voiceId}/stream`,
+      {
+        text,
+        model_id:         'eleven_turbo_v2',
+        voice_settings:   { stability: 0.5, similarity_boost: 0.8 },
+        output_format:    'mp3_44100_128',
+      },
+      {
+        headers: {
+          'xi-api-key':   process.env.ELEVENLABS_API_KEY,
+          'Content-Type': 'application/json',
+          'Accept':       'audio/mpeg',
+        },
+        responseType: 'arraybuffer',
+        timeout:      15000,
+      }
+    );
+
+    // Save audio to Supabase storage and get public URL
+    const fileName   = `calls/${Date.now()}_response.mp3`;
+    const audioBuffer = Buffer.from(response.data);
+
+    const { data: uploadData, error } = await supabase.storage
+      .from('call-audio')
+      .upload(fileName, audioBuffer, {
+        contentType: 'audio/mpeg',
+        upsert:       true,
+      });
+
+    if (error) throw error;
+
+    const { data: urlData } = supabase.storage
+      .from('call-audio')
+      .getPublicUrl(fileName);
+
+    return urlData.publicUrl;
+  } catch (err) {
+    console.error('ElevenLabs error:', err.message);
+    return null;
+  }
+}
+
+// ─────────────────────────────────────────────────────
+// HELPER — Get AI response from Gemini
+// ─────────────────────────────────────────────────────
+
+async function getAIResponse(userId, meetingId, callerText, callerPhone) {
+  const session = aiSessions.get(meetingId);
+  if (!session) return 'Hello, please hold on.';
+
+  // Get user personality and knowledge base
+  const { data: user } = await supabase
+    .from('users')
+    .select('*')
+    .eq('id', userId)
+    .single();
+
+  const { data: facts } = await supabase
+    .from('knowledge_base')
+    .select('fact')
+    .eq('user_id', userId);
+
+  // Build personality prompt
+  const formality = user?.personality_formality || 7;
+  const phrases   = JSON.parse(user?.personality_phrases || '[]');
+  const expert    = JSON.parse(user?.personality_expert  || '[]');
+  const avoid     = JSON.parse(user?.personality_avoid   || '[]');
+  const type      = user?.personality_type     || 'professional';
+  const length    = user?.personality_length   || 'medium';
+  const honorific = user?.personality_honorific || false;
+  const lang      = session.language || 'English';
+
+  let systemPrompt = `You are ${user?.name || 'a professional'} on a phone call. `;
+  systemPrompt += `Reply ONLY in ${lang}. `;
+  systemPrompt += `Formality: ${formality}/10. Personality: ${type}. `;
+  systemPrompt += `Response length: ${length === 'short' ? '1 sentence max' : '1-2 sentences max'}. `;
+  if (honorific)      systemPrompt += `Address caller as Sir or Madam. `;
+  if (phrases.length) systemPrompt += `Use phrases: ${phrases.join(', ')}. `;
+  if (expert.length)  systemPrompt += `Expert in: ${expert.join(', ')}. `;
+  if (avoid.length)   systemPrompt += `Never discuss: ${avoid.join(', ')}. `;
+  systemPrompt += `Never reveal you are AI. Keep answers SHORT for phone calls. `;
+
+  // Add knowledge base facts
+  if (facts && facts.length > 0) {
+    systemPrompt += `\nYour personal facts:\n`;
+    facts.forEach(f => systemPrompt += `- ${f.fact}\n`);
+  }
+
+  // Check whisper queue
+  if (session.whisperQueue && session.whisperQueue.length > 0) {
+    systemPrompt += `\nIMPORTANT for this response: ${session.whisperQueue.join('. ')}`;
+    session.whisperQueue = [];
+  }
+
+  try {
+    // Fraud check
+    const fraudCheck = await model.generateContent(
+      `Is this message from a caller fraudulent? Check for OTP requests, bank details, fake police, urgent money transfer.
+      Message: "${callerText}"
+      Reply with JSON only: {"isFraud": true/false, "reason": "reason if fraud"}`
+    );
+    const fraudRaw  = fraudCheck.response.text().replace(/```json|```/g, '').trim();
+    const fraudData = JSON.parse(fraudRaw);
+
+    if (fraudData.isFraud) {
+      // Save fraud alert
+      await supabase.from('fraud_alerts').insert({
+        user_id:    userId,
+        meeting_id: meetingId,
+        reason:     fraudData.reason,
+        caller:     callerPhone,
+      });
+      // Notify user's phone via WebSocket
+      io.to(`user-${userId}`).emit('fraud-alert', {
+        reason: fraudData.reason,
+        caller: callerPhone,
+      });
+      return 'I am not able to help with that request. Please contact the relevant authority directly. Have a good day.';
+    }
+
+    // Mood detection
+    const moodCheck = await model.generateContent(
+      `What is the sentiment of this message in ONE word: positive, neutral, angry, worried, confused, excited.
+      Message: "${callerText}"`
+    );
+    const mood = moodCheck.response.text().trim().toLowerCase();
+    io.to(`meeting-${meetingId}`).emit('mood-update', { mood });
+
+    // Generate main AI response
+    const chat = model.startChat({
+      history: [
+        { role: 'user',  parts: [{ text: systemPrompt }] },
+        { role: 'model', parts: [{ text: `Understood. I am ${user?.name}.` }] },
+        ...session.history,
+      ],
+    });
+
+    const result = await chat.sendMessage(callerText);
+    const text   = result.response.text();
+
+    // Update session history
+    session.history.push(
+      { role: 'user',  parts: [{ text: callerText }] },
+      { role: 'model', parts: [{ text }] }
+    );
+    if (session.history.length > 20) session.history = session.history.slice(-20);
+
+    // Send transcript to user's phone via WebSocket
+    io.to(`meeting-${meetingId}`).emit('transcript', {
+      callerText,
+      aiText:   text,
+      language: lang,
+      time:     new Date().toLocaleTimeString(),
+    });
+
+    return text;
+  } catch (err) {
+    console.error('AI response error:', err.message);
+    return 'I understand, give me just a moment please.';
+  }
+}
+
+// ─────────────────────────────────────────────────────
+// ROUTE 1: Incoming Call Webhook
+// Twilio calls this when someone dials your number
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/incoming', async (req, res) => {
+  res.setHeader('Content-Type', 'text/xml');
+
+  try {
+    const callSid     = req.body.CallSid;
+    const callerPhone = req.body.From;
+    const toPhone     = req.body.To; // Your Twilio number
+
+    console.log(`📞 Incoming call from ${callerPhone} to ${toPhone}`);
+
+    // Find which user owns this Twilio number
+    const { data: user } = await supabase
+      .from('users')
+      .select('*')
+      .eq('twilio_number', toPhone)
+      .single();
+
+    if (!user) {
+      console.error('No user found for Twilio number:', toPhone);
+      res.send(buildEndTwiML());
+      return;
+    }
+
+    // Check if panic mode is on
+    if (user.panic_mode) {
+      res.send(buildEndTwiML());
+      return;
+    }
+
+    // Check if AI is ON
+    if (!user.ai_enabled) {
+      // AI is off — forward to user's real phone
+      console.log(`AI is OFF — forwarding to ${user.phone}`);
+      res.send(buildForwardTwiML(user.phone));
+      return;
+    }
+
+    // Create new meeting session
+    const meetingId = `twilio_${callSid}`;
+    aiSessions.set(meetingId, {
+      userId:       user.id,
+      callSid,
+      callerPhone,
+      history:      [],
+      language:     'English',
+      startTime:    Date.now(),
+      voiceId:      user.voice_id || 'EXAVITQu4vr4xnSDxMaL',
+      whisperQueue: [],
+    });
+
+    // Save meeting to database
+    const { data: meeting } = await supabase.from('meetings').insert({
+      user_id:     user.id,
+      from_number: callerPhone,
+      call_sid:    callSid,
+      status:      'active',
+    }).select().single();
+
+    const dbMeetingId = meeting?.id || meetingId;
+
+    // Notify user's phone — show Active Meeting screen
+    io.to(`user-${user.id}`).emit('call-incoming', {
+      meetingId:    dbMeetingId,
+      callerPhone,
+      callSid,
+      autoAnswer:   true,
+    });
+
+    // Send call screening notification (10s window)
+    io.to(`user-${user.id}`).emit('call-screening', {
+      meetingId:    dbMeetingId,
+      callerPhone,
+      callSid,
+    });
+
+    // Generate greeting with user's cloned voice
+    const greetingText = `Hello, this is ${user.name} speaking.`;
+    const gatherUrl    = `${process.env.BACKEND_URL}/api/twilio/respond?meetingId=${dbMeetingId}&userId=${user.id}`;
+    const audioUrl     = await generateVoiceAudio(greetingText, user.voice_id);
+
+    if (audioUrl) {
+      res.send(buildGreetingTwiML(audioUrl, gatherUrl));
+    } else {
+      // Fallback to Twilio TTS
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Aditi">Hello, this is ${user.name} speaking. How can I help you?</Say>
+  <Gather input="speech" action="${gatherUrl}" method="POST"
+    speechTimeout="auto" speechModel="phone_call" timeout="5">
+  </Gather>
+</Response>`);
+    }
+
+  } catch (err) {
+    console.error('Twilio incoming error:', err.message);
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Sorry, there was an issue. Please try again later.</Say>
+  <Hangup/>
+</Response>`);
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 2: Gather/Respond — AI Processes Caller Speech
+// Twilio calls this after caller speaks
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/respond', async (req, res) => {
+  res.setHeader('Content-Type', 'text/xml');
+
+  try {
+    const { meetingId, userId } = req.query;
+    const callerSpeech = req.body.SpeechResult || '';
+    const callerPhone  = req.body.From || req.body.Caller || '';
+    const isRetry      = req.query.retry === 'true';
+
+    const gatherUrl = `${process.env.BACKEND_URL}/api/twilio/respond?meetingId=${meetingId}&userId=${userId}`;
+
+    // Handle silence / no speech detected
+    if (!callerSpeech.trim()) {
+      if (isRetry) {
+        // Still no speech after retry — prompt again
+        res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>I am here. Please go ahead and speak.</Say>
+  <Gather input="speech" action="${gatherUrl}" method="POST"
+    speechTimeout="auto" timeout="8">
+  </Gather>
+  <Hangup/>
+</Response>`);
+      } else {
+        res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Gather input="speech" action="${gatherUrl}" method="POST"
+    speechTimeout="auto" timeout="8">
+  </Gather>
+  <Redirect>${gatherUrl}?retry=true</Redirect>
+</Response>`);
+      }
+      return;
+    }
+
+    console.log(`🗣️ Caller said: "${callerSpeech}"`);
+
+    // Get AI response
+    const session = aiSessions.get(meetingId);
+    if (!session) {
+      res.send(buildEndTwiML());
+      return;
+    }
+
+    // Detect language from caller speech
+    try {
+      const langDetect = await model.generateContent(
+        `What language is this text in? Reply with language name only (English, Hindi, Hinglish, etc.): "${callerSpeech}"`
+      );
+      const detectedLang = langDetect.response.text().trim();
+      session.language = detectedLang;
+      io.to(`meeting-${meetingId}`).emit('language-detected', { language: detectedLang });
+    } catch {}
+
+    // Get AI response from Gemini
+    const aiText = await getAIResponse(userId, meetingId, callerSpeech, callerPhone);
+
+    // Generate audio with user's cloned voice
+    const audioUrl = await generateVoiceAudio(aiText, session.voiceId);
+
+    if (audioUrl) {
+      res.send(buildSpeakTwiML(audioUrl, gatherUrl));
+    } else {
+      // Fallback to Twilio TTS
+      res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="Polly.Aditi">${aiText}</Say>
+  <Gather input="speech" action="${gatherUrl}" method="POST"
+    speechTimeout="auto" timeout="5">
+  </Gather>
+</Response>`);
+    }
+
+  } catch (err) {
+    console.error('Twilio respond error:', err.message);
+    res.send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>One moment please.</Say>
+  <Gather input="speech" action="${req.query.gatherUrl || '/api/twilio/respond'}" method="POST"
+    speechTimeout="auto" timeout="5">
+  </Gather>
+</Response>`);
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 3: Call Status Webhook
+// Twilio calls this when call ends
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/status', async (req, res) => {
+  res.sendStatus(200);
+
+  try {
+    const { CallSid, CallStatus, CallDuration } = req.body;
+    const meetingId = `twilio_${CallSid}`;
+
+    if (CallStatus === 'completed') {
+      console.log(`📴 Call ${CallSid} ended. Duration: ${CallDuration}s`);
+
+      const session = aiSessions.get(meetingId);
+      if (!session) return;
+
+      const userId    = session.userId;
+      const duration  = Math.floor(parseInt(CallDuration || '0') / 60);
+
+      let summary     = 'Meeting completed.';
+      let actionItems = [];
+      let sentiment   = 'neutral';
+
+      if (session.history.length >= 2) {
+        const transcript = session.history
+          .map(m => `${m.role === 'user' ? 'Caller' : 'AI'}: ${m.parts[0].text}`)
+          .join('\n');
+
+        try {
+          const sumResult = await model.generateContent(
+            `Analyze this phone call and respond in JSON only:
+            {
+              "summary": "3 sentence summary",
+              "sentiment": "positive|neutral|angry|worried|confused",
+              "actionItems": ["action 1", "action 2"]
+            }
+            Transcript:\n${transcript}`
+          );
+          const raw  = sumResult.response.text().replace(/```json|```/g, '').trim();
+          const data = JSON.parse(raw);
+          summary     = data.summary     || summary;
+          sentiment   = data.sentiment   || sentiment;
+          actionItems = data.actionItems || [];
+        } catch {}
+      }
+
+      aiSessions.delete(meetingId);
+
+      // Generate watermark
+      const timestamp = Date.now().toString();
+      const watermark = crypto
+        .createHmac('sha256', process.env.JWT_SECRET)
+        .update(`${userId}:${meetingId}:${timestamp}`)
+        .digest('hex').slice(0, 16);
+
+      // Update meeting in database
+      await supabase.from('meetings')
+        .update({
+          status:         'completed',
+          summary,
+          duration,
+          watermark_data: JSON.stringify({ watermark, timestamp }),
+        })
+        .eq('call_sid', CallSid);
+
+      // Notify user's phone
+      io.to(`user-${userId}`).emit('meeting-ended', { summary, duration });
+
+      // Send Gmail summary if enabled
+      const { data: user } = await supabase
+        .from('users')
+        .select('gmail_summary_enabled,gmail_summary_email,google_access_token,phone')
+        .eq('id', userId).single();
+
+      if (user?.gmail_summary_enabled && user?.google_access_token && user?.gmail_summary_email) {
+        sendGmailSummary(
+          user.google_access_token,
+          user.gmail_summary_email,
+          session.callerPhone,
+          summary,
+          duration,
+          sentiment,
+          actionItems
+        ).catch(err => console.error('Gmail error:', err.message));
+      }
+    }
+  } catch (err) {
+    console.error('Twilio status error:', err.message);
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 4: Take Over — User speaks directly
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/takeover', authMiddleware, async (req, res) => {
+  try {
+    const { callSid, meetingId } = req.body;
+
+    const twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN
+    );
+
+    // Update call to forward to user's real phone
+    const { data: user } = await supabase
+      .from('users').select('phone').eq('id', req.userId).single();
+
+    await twilioClient.calls(callSid).update({
+      twiml: buildForwardTwiML(user.phone),
+    });
+
+    const session = aiSessions.get(meetingId);
+    if (session) session.takenOver = true;
+
+    io.to(`meeting-${meetingId}`).emit('call-taken-over', { meetingId });
+    res.json({ success: true, message: 'Call transferred to your phone' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 5: End Call — Hang up from app
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/end-call', authMiddleware, async (req, res) => {
+  try {
+    const { callSid } = req.body;
+
+    const twilioClient = twilio(
+      process.env.TWILIO_ACCOUNT_SID,
+      process.env.TWILIO_AUTH_TOKEN
+    );
+
+    await twilioClient.calls(callSid).update({ status: 'completed' });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 6: Toggle AI ON/OFF
+// Updates Twilio webhook based on AI state
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/toggle-ai', authMiddleware, async (req, res) => {
+  try {
+    const { enabled } = req.body;
+
+    await supabase.from('users')
+      .update({ ai_enabled: enabled })
+      .eq('id', req.userId);
+
+    io.to(`user-${req.userId}`).emit('ai-toggled', { enabled });
+    res.json({ success: true, aiEnabled: enabled });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 7: Save Twilio Number for User
+// ─────────────────────────────────────────────────────
+
+app.post('/api/twilio/setup', authMiddleware, async (req, res) => {
+  try {
+    const { twilioNumber } = req.body;
+
+    await supabase.from('users')
+      .update({ twilio_number: twilioNumber })
+      .eq('id', req.userId);
+
+    res.json({
+      success:       true,
+      twilioNumber,
+      webhookUrl:    `${process.env.BACKEND_URL}/api/twilio/incoming`,
+      statusUrl:     `${process.env.BACKEND_URL}/api/twilio/status`,
+      message:       'Set these URLs in your Twilio console',
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 8: Get Twilio setup status
+// ─────────────────────────────────────────────────────
+
+app.get('/api/twilio/status-check', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('twilio_number,ai_enabled,voice_id')
+      .eq('id', req.userId).single();
+
+    res.json({
+      twilioNumber:  user?.twilio_number  || null,
+      aiEnabled:     user?.ai_enabled     || false,
+      voiceReady:    !!user?.voice_id,
+      webhookUrl:    `${process.env.BACKEND_URL}/api/twilio/incoming`,
+      statusUrl:     `${process.env.BACKEND_URL}/api/twilio/status`,
+      isFullySetup:  !!(user?.twilio_number && user?.voice_id),
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
