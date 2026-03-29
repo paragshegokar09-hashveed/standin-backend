@@ -4025,6 +4025,484 @@ app.post('/api/expiry/settings', authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
+// GOOGLE OAUTH — FULLY OPERATIONAL
+// Gmail Summary + Google Calendar Integration
+// Paste into index.js BEFORE "START SERVER" section
+// ═══════════════════════════════════════════════════
+
+const { google } = require('googleapis');
+
+// ─────────────────────────────────────────────────────
+// HELPER — Create OAuth2 Client
+// ─────────────────────────────────────────────────────
+function getOAuthClient() {
+  return new google.auth.OAuth2(
+    process.env.GOOGLE_CLIENT_ID,
+    process.env.GOOGLE_CLIENT_SECRET,
+    `${process.env.BACKEND_URL}/api/oauth/google/callback`
+  );
+}
+
+// ─────────────────────────────────────────────────────
+// ROUTE 1: Generate Google OAuth URL
+// App calls this → gets URL → user opens in browser
+// ─────────────────────────────────────────────────────
+app.get('/api/oauth/google/url', authMiddleware, async (req, res) => {
+  try {
+    const oauth2Client = getOAuthClient();
+    const url = oauth2Client.generateAuthUrl({
+      access_type:  'offline',
+      prompt:       'consent',
+      scope: [
+        'https://www.googleapis.com/auth/gmail.send',
+        'https://www.googleapis.com/auth/calendar',
+        'https://www.googleapis.com/auth/calendar.events',
+        'https://www.googleapis.com/auth/userinfo.email',
+        'https://www.googleapis.com/auth/userinfo.profile',
+      ],
+      state: req.userId,
+    });
+    res.json({ url, message: 'Open this URL in browser to connect Google' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 2: OAuth Callback — Google redirects here
+// Saves access token + refresh token to Supabase
+// ─────────────────────────────────────────────────────
+app.get('/api/oauth/google/callback', async (req, res) => {
+  try {
+    const { code, state: userId } = req.query;
+
+    if (!code || !userId) {
+      return res.status(400).send(`
+        <html><body style="font-family:sans-serif;text-align:center;padding:40px">
+          <h2>❌ OAuth Failed</h2>
+          <p>Missing code or user ID</p>
+        </body></html>
+      `);
+    }
+
+    const oauth2Client = getOAuthClient();
+    const { tokens }   = await oauth2Client.getToken(code);
+    oauth2Client.setCredentials(tokens);
+
+    // Get user's Google email
+    const oauth2 = google.oauth2({ version: 'v2', auth: oauth2Client });
+    const { data: googleUser } = await oauth2.userinfo.get();
+
+    // Save tokens to Supabase
+    await supabase.from('users').update({
+      google_access_token:    tokens.access_token,
+      google_refresh_token:   tokens.refresh_token || null,
+      google_token_expiry:    tokens.expiry_date
+        ? new Date(tokens.expiry_date).toISOString() : null,
+      google_email:           googleUser.email,
+      gmail_summary_enabled:  true,
+      gmail_summary_email:    googleUser.email,
+      calendar_connected:     true,
+    }).eq('id', userId);
+
+    // Send success page
+    res.send(`
+      <html>
+      <body style="font-family:-apple-system,sans-serif;text-align:center;
+        padding:60px 20px;background:#060810;color:#F4F6FF;">
+        <div style="max-width:400px;margin:0 auto;">
+          <div style="font-size:60px;margin-bottom:20px;">✅</div>
+          <h2 style="color:#00E5CC;margin-bottom:10px;">Google Connected!</h2>
+          <p style="color:rgba(244,246,255,.6);margin-bottom:6px;">
+            Connected as: <strong style="color:#F4F6FF">${googleUser.email}</strong>
+          </p>
+          <p style="color:rgba(244,246,255,.5);font-size:13px;margin-bottom:30px;">
+            Gmail Summary ✅ &nbsp; Calendar ✅
+          </p>
+          <p style="color:rgba(244,246,255,.4);font-size:12px;">
+            You can close this browser tab and return to the app.
+          </p>
+        </div>
+      </body></html>
+    `);
+
+  } catch (err) {
+    console.error('OAuth callback error:', err.message);
+    res.status(500).send(`
+      <html><body style="font-family:sans-serif;text-align:center;padding:40px;
+        background:#060810;color:#F4F6FF;">
+        <h2>❌ Connection Failed</h2>
+        <p style="color:rgba(244,246,255,.5)">${err.message}</p>
+        <p>Please close this tab and try again in the app.</p>
+      </body></html>
+    `);
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 3: Check OAuth status
+// ─────────────────────────────────────────────────────
+app.get('/api/oauth/google/status', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('google_email,google_access_token,calendar_connected,gmail_summary_enabled')
+      .eq('id', req.userId)
+      .single();
+
+    res.json({
+      connected:      !!user?.google_access_token,
+      email:          user?.google_email || null,
+      calendarReady:  user?.calendar_connected || false,
+      gmailReady:     user?.gmail_summary_enabled || false,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 4: Disconnect Google
+// ─────────────────────────────────────────────────────
+app.post('/api/oauth/google/disconnect', authMiddleware, async (req, res) => {
+  try {
+    await supabase.from('users').update({
+      google_access_token:   null,
+      google_refresh_token:  null,
+      google_token_expiry:   null,
+      google_email:          null,
+      gmail_summary_enabled: false,
+      calendar_connected:    false,
+    }).eq('id', req.userId);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// HELPER — Get valid OAuth client for user
+// Auto-refreshes token if expired
+// ─────────────────────────────────────────────────────
+async function getUserOAuthClient(userId) {
+  const { data: user } = await supabase
+    .from('users')
+    .select('google_access_token,google_refresh_token,google_token_expiry')
+    .eq('id', userId)
+    .single();
+
+  if (!user?.google_access_token) {
+    throw new Error('Google not connected. Please connect Google in Settings.');
+  }
+
+  const oauth2Client = getOAuthClient();
+  oauth2Client.setCredentials({
+    access_token:  user.google_access_token,
+    refresh_token: user.google_refresh_token,
+    expiry_date:   user.google_token_expiry
+      ? new Date(user.google_token_expiry).getTime() : null,
+  });
+
+  // Auto-refresh if expired
+  const expiry = user.google_token_expiry
+    ? new Date(user.google_token_expiry).getTime() : null;
+  const now    = Date.now();
+
+  if (expiry && expiry - now < 5 * 60 * 1000) {
+    const { credentials } = await oauth2Client.refreshAccessToken();
+    await supabase.from('users').update({
+      google_access_token: credentials.access_token,
+      google_token_expiry: credentials.expiry_date
+        ? new Date(credentials.expiry_date).toISOString() : null,
+    }).eq('id', userId);
+    oauth2Client.setCredentials(credentials);
+  }
+
+  return oauth2Client;
+}
+
+// ─────────────────────────────────────────────────────
+// GMAIL SUMMARY — Send email after every call
+// Called from Twilio status route when call ends
+// ─────────────────────────────────────────────────────
+async function sendGmailSummary(userId, callerPhone, summary, duration, sentiment, actionItems) {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('gmail_summary_email,gmail_summary_enabled,name')
+      .eq('id', userId).single();
+
+    if (!user?.gmail_summary_enabled || !user?.gmail_summary_email) return;
+
+    const oauth2Client = await getUserOAuthClient(userId);
+    const gmail        = google.gmail({ version: 'v1', auth: oauth2Client });
+
+    const sentimentEmoji = {
+      positive:'😊', neutral:'😐', angry:'😠',
+      worried:'😟', confused:'🤔', excited:'🤩',
+    }[sentiment] || '😐';
+
+    const actionList = (actionItems || [])
+      .map(a => `<li style="margin-bottom:6px">${a}</li>`)
+      .join('');
+
+    const html = `
+<!DOCTYPE html>
+<html>
+<head><meta charset="UTF-8"></head>
+<body style="margin:0;padding:0;background:#f0f0f0;font-family:-apple-system,sans-serif">
+<table width="100%" cellpadding="0" cellspacing="0" style="background:#f0f0f0;padding:30px 0">
+  <tr><td align="center">
+  <table width="560" cellpadding="0" cellspacing="0"
+    style="background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)">
+
+    <!-- Header -->
+    <tr><td style="background:linear-gradient(135deg,#0D0618,#1a0a30);padding:28px 32px">
+      <table width="100%"><tr>
+        <td>
+          <p style="margin:0;font-size:11px;color:rgba(244,246,255,.5);
+            text-transform:uppercase;letter-spacing:1px">StandIn AI</p>
+          <h1 style="margin:4px 0 0;font-size:22px;color:#fff;font-weight:800">
+            Meeting Report
+          </h1>
+        </td>
+        <td align="right">
+          <div style="background:rgba(0,229,204,.15);border:1px solid rgba(0,229,204,.3);
+            border-radius:8px;padding:8px 14px;display:inline-block">
+            <p style="margin:0;font-size:11px;color:#00E5CC;font-weight:700">AI SUMMARY</p>
+          </div>
+        </td>
+      </tr></table>
+    </td></tr>
+
+    <!-- Meta row -->
+    <tr><td style="padding:0 32px">
+      <table width="100%" style="border-bottom:1px solid #f0f0f0;padding:20px 0">
+        <tr>
+          <td width="25%" align="center" style="padding:12px 8px">
+            <p style="margin:0;font-size:20px">📞</p>
+            <p style="margin:4px 0 0;font-size:11px;color:#9ca3af">Caller</p>
+            <p style="margin:3px 0 0;font-size:13px;font-weight:700;color:#1a1a2e">
+              ${callerPhone}
+            </p>
+          </td>
+          <td width="25%" align="center" style="padding:12px 8px">
+            <p style="margin:0;font-size:20px">⏱️</p>
+            <p style="margin:4px 0 0;font-size:11px;color:#9ca3af">Duration</p>
+            <p style="margin:3px 0 0;font-size:13px;font-weight:700;color:#1a1a2e">
+              ${duration} min
+            </p>
+          </td>
+          <td width="25%" align="center" style="padding:12px 8px">
+            <p style="margin:0;font-size:20px">${sentimentEmoji}</p>
+            <p style="margin:4px 0 0;font-size:11px;color:#9ca3af">Sentiment</p>
+            <p style="margin:3px 0 0;font-size:13px;font-weight:700;color:#1a1a2e">
+              ${sentiment || 'Neutral'}
+            </p>
+          </td>
+          <td width="25%" align="center" style="padding:12px 8px">
+            <p style="margin:0;font-size:20px">📅</p>
+            <p style="margin:4px 0 0;font-size:11px;color:#9ca3af">Date</p>
+            <p style="margin:3px 0 0;font-size:13px;font-weight:700;color:#1a1a2e">
+              ${new Date().toLocaleDateString('en-IN',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'})}
+            </p>
+          </td>
+        </tr>
+      </table>
+    </td></tr>
+
+    <!-- Summary -->
+    <tr><td style="padding:24px 32px">
+      <h3 style="margin:0 0 12px;font-size:13px;font-weight:700;color:#374151;
+        text-transform:uppercase;letter-spacing:.5px">📝 AI Summary</h3>
+      <div style="background:#f8f7ff;border-left:4px solid #7c3aed;
+        border-radius:0 8px 8px 0;padding:14px 16px">
+        <p style="margin:0;font-size:14px;color:#374151;line-height:1.7">
+          ${summary || 'Meeting completed successfully.'}
+        </p>
+      </div>
+    </td></tr>
+
+    <!-- Action Items -->
+    ${actionList ? `
+    <tr><td style="padding:0 32px 24px">
+      <h3 style="margin:0 0 12px;font-size:13px;font-weight:700;color:#374151;
+        text-transform:uppercase;letter-spacing:.5px">⚡ Action Items</h3>
+      <ul style="margin:0;padding-left:20px;color:#374151;font-size:13px;line-height:1.7">
+        ${actionList}
+      </ul>
+    </td></tr>` : ''}
+
+    <!-- Footer -->
+    <tr><td style="background:#f8f8f8;padding:16px 32px;border-top:1px solid #f0f0f0">
+      <p style="margin:0;font-size:11px;color:#9ca3af;text-align:center">
+        Sent by <strong>StandIn AI</strong> •
+        AI answered this call on behalf of ${user.name || 'you'}
+      </p>
+    </td></tr>
+
+  </table>
+  </td></tr>
+</table>
+</body></html>`;
+
+    // Encode email
+    const subject  = `📋 Meeting Summary — ${callerPhone} (${duration} min)`;
+    const message  = [
+      `To: ${user.gmail_summary_email}`,
+      `Subject: ${subject}`,
+      `MIME-Version: 1.0`,
+      `Content-Type: text/html; charset=UTF-8`,
+      ``,
+      html,
+    ].join('\n');
+
+    const encoded = Buffer.from(message).toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    await gmail.users.messages.send({
+      userId: 'me',
+      requestBody: { raw: encoded },
+    });
+
+    console.log(`📧 Gmail summary sent to ${user.gmail_summary_email}`);
+  } catch (err) {
+    console.error('Gmail send error:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────────────
+// ROUTE 5: Test Gmail — send test email
+// ─────────────────────────────────────────────────────
+app.post('/api/oauth/test-gmail', authMiddleware, async (req, res) => {
+  try {
+    await sendGmailSummary(
+      req.userId,
+      '+91 82630 89509',
+      'This is a test meeting summary from StandIn AI. Your Gmail integration is working correctly!',
+      5,
+      'positive',
+      ['Test action item 1', 'Test action item 2']
+    );
+    res.json({ success: true, message: 'Test email sent! Check your inbox.' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// CALENDAR — Check availability
+// ─────────────────────────────────────────────────────
+app.post('/api/calendar/check', authMiddleware, async (req, res) => {
+  try {
+    const { dateTime, duration = 60 } = req.body;
+
+    const oauth2Client = await getUserOAuthClient(req.userId);
+    const calendar     = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    const startTime = new Date(dateTime);
+    const endTime   = new Date(startTime.getTime() + duration * 60000);
+
+    const { data } = await calendar.freebusy.query({
+      requestBody: {
+        timeMin: startTime.toISOString(),
+        timeMax: endTime.toISOString(),
+        items:   [{ id: 'primary' }],
+      },
+    });
+
+    const busy     = data.calendars?.primary?.busy || [];
+    const isFree   = busy.length === 0;
+
+    res.json({ isFree, busy, startTime, endTime });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// CALENDAR — Book a meeting
+// ─────────────────────────────────────────────────────
+app.post('/api/calendar/book', authMiddleware, async (req, res) => {
+  try {
+    const { title, dateTime, duration = 60, callerEmail, callerName } = req.body;
+
+    const oauth2Client = await getUserOAuthClient(req.userId);
+    const calendar     = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    const { data: user } = await supabase
+      .from('users')
+      .select('name,google_email')
+      .eq('id', req.userId).single();
+
+    const startTime = new Date(dateTime);
+    const endTime   = new Date(startTime.getTime() + duration * 60000);
+
+    const attendees = [{ email: user.google_email }];
+    if (callerEmail) attendees.push({ email: callerEmail });
+
+    const event = {
+      summary:     title || `Meeting with ${callerName || 'Caller'}`,
+      description: `Meeting booked by StandIn AI during a phone call.`,
+      start:       { dateTime: startTime.toISOString(), timeZone: 'Asia/Kolkata' },
+      end:         { dateTime: endTime.toISOString(),   timeZone: 'Asia/Kolkata' },
+      attendees,
+      reminders: {
+        useDefault: false,
+        overrides:  [{ method: 'popup', minutes: 30 }],
+      },
+    };
+
+    const { data: createdEvent } = await calendar.events.insert({
+      calendarId:           'primary',
+      requestBody:          event,
+      sendUpdates:          'all',
+    });
+
+    res.json({
+      success:  true,
+      eventId:  createdEvent.id,
+      eventUrl: createdEvent.htmlLink,
+      message:  `Meeting booked for ${startTime.toLocaleString('en-IN')}`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// ROUTE 6: Test Calendar
+// ─────────────────────────────────────────────────────
+app.post('/api/oauth/test-calendar', authMiddleware, async (req, res) => {
+  try {
+    const oauth2Client = await getUserOAuthClient(req.userId);
+    const calendar     = google.calendar({ version: 'v3', auth: oauth2Client });
+
+    // List next 5 events
+    const { data } = await calendar.events.list({
+      calendarId:  'primary',
+      timeMin:     new Date().toISOString(),
+      maxResults:  5,
+      singleEvents:true,
+      orderBy:     'startTime',
+    });
+
+    res.json({
+      success: true,
+      events:  data.items || [],
+      message: `Calendar working! Found ${data.items?.length || 0} upcoming events.`,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Make sendGmailSummary available globally
+global.sendGmailSummary = sendGmailSummary;
+global.getUserOAuthClient = getUserOAuthClient;
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
