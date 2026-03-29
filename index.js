@@ -4503,6 +4503,69 @@ global.sendGmailSummary = sendGmailSummary;
 global.getUserOAuthClient = getUserOAuthClient;
 
 // ═══════════════════════════════════════════════════
+// INTRUDER PHOTO UPLOAD ROUTE
+// Add to index.js BEFORE START SERVER
+// ═══════════════════════════════════════════════════
+
+const multer  = require('multer');
+const storage = multer.memoryStorage();
+const upload  = multer({ storage, limits: { fileSize: 5 * 1024 * 1024 } });
+
+// Upload intruder photo to Supabase Storage
+app.post('/api/biometric/upload-intruder-photo',
+  authMiddleware,
+  upload.single('photo'),
+  async (req, res) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'No photo provided' });
+      }
+
+      const fileName = `intruders/${req.userId}/${Date.now()}.jpg`;
+
+      // Upload to Supabase Storage
+      const { data, error } = await supabase.storage
+        .from('intruder-photos')
+        .upload(fileName, req.file.buffer, {
+          contentType: 'image/jpeg',
+          upsert:      true,
+        });
+
+      if (error) throw error;
+
+      // Get public URL
+      const { data: urlData } = supabase.storage
+        .from('intruder-photos')
+        .getPublicUrl(fileName);
+
+      const photoUrl = urlData.publicUrl;
+
+      // Save to intruder_alerts table
+      await supabase.from('intruder_alerts').insert({
+        user_id:   req.userId,
+        photo_url: photoUrl,
+        attempts:  3,
+        timestamp: new Date().toISOString(),
+      });
+
+      // Send WebSocket notification to user's devices
+      io.to(`user-${req.userId}`).emit('intruder-detected', {
+        photoUrl,
+        timestamp: new Date().toISOString(),
+        message:   'Unauthorized access attempt detected',
+      });
+
+      console.log(`📸 Intruder photo saved for user ${req.userId}`);
+      res.json({ success: true, photoUrl });
+
+    } catch (err) {
+      console.error('Intruder photo error:', err.message);
+      res.status(500).json({ error: err.message });
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
