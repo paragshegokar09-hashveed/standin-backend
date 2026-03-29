@@ -3506,6 +3506,150 @@ app.get('/api/biometric/intruder-alerts', authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
+// INTELLIGENCE REPORT BACKEND ROUTES
+// Paste into index.js BEFORE "START SERVER" section
+// ═══════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────
+// Get full intelligence report for one meeting
+// ─────────────────────────────────────────────────────
+app.get('/api/meetings/report/:meetingId', authMiddleware, async (req, res) => {
+  try {
+    const { meetingId } = req.params;
+
+    // Get meeting from DB
+    const { data: meeting, error } = await supabase
+      .from('meetings')
+      .select('*')
+      .eq('id', meetingId)
+      .eq('user_id', req.userId)
+      .single();
+
+    if (error || !meeting) {
+      return res.status(404).json({ error: 'Meeting not found' });
+    }
+
+    // Parse existing summary or generate detailed report
+    let actionItems = [];
+    let keyTopics   = [];
+    let riskFlags   = [];
+    let decisions   = [];
+    let followUps   = [];
+    let sentiment   = 'neutral';
+
+    if (meeting.summary) {
+      try {
+        // Use Gemini to extract structured data from summary
+        const analysisResult = await model.generateContent(
+          `Analyze this meeting summary and extract structured data.
+          Return ONLY valid JSON with NO extra text:
+          {
+            "sentiment": "positive|neutral|angry|worried|confused|excited",
+            "actionItems": ["action item 1", "action item 2"],
+            "keyTopics": ["topic 1", "topic 2", "topic 3"],
+            "riskFlags": ["risk 1"],
+            "decisions": ["decision 1"],
+            "followUps": ["follow up 1"]
+          }
+          
+          Meeting summary: ${meeting.summary}`
+        );
+
+        const raw  = analysisResult.response.text()
+          .replace(/```json|```/g, '').trim();
+        const data = JSON.parse(raw);
+
+        actionItems = data.actionItems || [];
+        keyTopics   = data.keyTopics   || [];
+        riskFlags   = data.riskFlags   || [];
+        decisions   = data.decisions   || [];
+        followUps   = data.followUps   || [];
+        sentiment   = data.sentiment   || 'neutral';
+      } catch (parseErr) {
+        console.error('Analysis parse error:', parseErr);
+        // Fallback defaults
+        actionItems = ['Review meeting notes'];
+        keyTopics   = ['General discussion'];
+      }
+    }
+
+    res.json({
+      meeting,
+      sentiment,
+      actionItems,
+      keyTopics,
+      riskFlags,
+      decisions,
+      followUps,
+    });
+
+  } catch (err) {
+    console.error('Report error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// Get all meetings list for Dashboard
+// ─────────────────────────────────────────────────────
+app.get('/api/meetings/list', authMiddleware, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit as string) || 20;
+    const page  = parseInt(req.query.page  as string) || 0;
+
+    const { data: meetings, count } = await supabase
+      .from('meetings')
+      .select('id,from_number,duration,summary,language,created_at,status', { count:'exact' })
+      .eq('user_id', req.userId)
+      .eq('status', 'completed')
+      .order('created_at', { ascending: false })
+      .range(page * limit, (page + 1) * limit - 1);
+
+    // Get stats
+    const { count: totalCalls } = await supabase
+      .from('meetings')
+      .select('id', { count:'exact' })
+      .eq('user_id', req.userId);
+
+    const { data: todayCalls } = await supabase
+      .from('meetings')
+      .select('duration')
+      .eq('user_id', req.userId)
+      .gte('created_at', new Date().toISOString().split('T')[0]);
+
+    const totalDuration = (todayCalls || []).reduce((sum: number, m: any) => sum + (m.duration || 0), 0);
+
+    res.json({
+      meetings:      meetings || [],
+      total:         count || 0,
+      totalCalls:    totalCalls || 0,
+      todayDuration: totalDuration,
+      todayCalls:    (todayCalls || []).length,
+    });
+  } catch (err) {
+    console.error('Meetings list error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// Delete a meeting
+// ─────────────────────────────────────────────────────
+app.delete('/api/meetings/:meetingId', authMiddleware, async (req, res) => {
+  try {
+    await supabase
+      .from('meetings')
+      .delete()
+      .eq('id', req.params.meetingId)
+      .eq('user_id', req.userId);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
