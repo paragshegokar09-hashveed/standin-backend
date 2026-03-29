@@ -3839,6 +3839,192 @@ async function encryptAndSaveTranscript(userId, meetingId, transcript) {
 }
 
 // ═══════════════════════════════════════════════════
+// DATA EXPIRY CRON JOB ROUTES
+// Paste into index.js BEFORE "START SERVER" section
+// ═══════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────
+// CRON JOB — Runs daily to delete expired data
+// This route is called by Render Cron Job every day
+// ─────────────────────────────────────────────────────
+
+app.post('/api/cron/data-expiry', async (req, res) => {
+  try {
+    // Verify this request comes from Render Cron
+    // (simple secret key check)
+    const cronSecret = req.headers['x-cron-secret'];
+    if (cronSecret !== process.env.CRON_SECRET) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    console.log('🕐 Running data expiry cron job...');
+
+    let totalDeleted = 0;
+    const results    = [];
+
+    // Get all users with expiry settings set
+    const { data: users } = await supabase
+      .from('users')
+      .select('id, transcript_expiry, voice_expiry, summary_expiry')
+      .not('transcript_expiry', 'is', null);
+
+    if (!users || users.length === 0) {
+      return res.json({
+        success: true,
+        message: 'No users with expiry settings',
+        deleted: 0,
+      });
+    }
+
+    for (const user of users) {
+      const userResult = { userId: user.id, deleted: 0 };
+
+      // Delete expired meetings (transcripts)
+      if (user.transcript_expiry && user.transcript_expiry > 0) {
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - user.transcript_expiry);
+
+        const { data: deleted, error } = await supabase
+          .from('meetings')
+          .delete()
+          .eq('user_id', user.id)
+          .lt('created_at', cutoffDate.toISOString())
+          .select('id');
+
+        if (!error && deleted) {
+          userResult.deleted += deleted.length;
+          totalDeleted       += deleted.length;
+          console.log(`  User ${user.id}: deleted ${deleted.length} meetings`);
+        }
+      }
+
+      // Delete expired knowledge base entries
+      if (user.voice_expiry && user.voice_expiry > 0) {
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - user.voice_expiry);
+
+        await supabase
+          .from('context_documents')
+          .delete()
+          .eq('user_id', user.id)
+          .lt('created_at', cutoffDate.toISOString());
+      }
+
+      // Delete expired fraud alerts
+      if (user.transcript_expiry && user.transcript_expiry > 0) {
+        const cutoffDate = new Date();
+        cutoffDate.setDate(cutoffDate.getDate() - user.transcript_expiry);
+
+        await supabase
+          .from('fraud_alerts')
+          .delete()
+          .eq('user_id', user.id)
+          .lt('created_at', cutoffDate.toISOString());
+
+        // Delete expired intruder alerts
+        await supabase
+          .from('intruder_alerts')
+          .delete()
+          .eq('user_id', user.id)
+          .lt('created_at', cutoffDate.toISOString());
+      }
+
+      results.push(userResult);
+    }
+
+    console.log(`✅ Cron complete. Total deleted: ${totalDeleted} records`);
+
+    res.json({
+      success:      true,
+      message:      `Data expiry complete`,
+      totalDeleted,
+      usersChecked: users.length,
+      timestamp:    new Date().toISOString(),
+      results,
+    });
+
+  } catch (err) {
+    console.error('Cron error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// Manual trigger — user can trigger from app
+// ─────────────────────────────────────────────────────
+app.post('/api/cron/manual-cleanup', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('transcript_expiry, voice_expiry')
+      .eq('id', req.userId)
+      .single();
+
+    if (!user?.transcript_expiry) {
+      return res.json({ success: true, message: 'No expiry settings configured', deleted: 0 });
+    }
+
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - user.transcript_expiry);
+
+    const { data: deleted } = await supabase
+      .from('meetings')
+      .delete()
+      .eq('user_id', req.userId)
+      .lt('created_at', cutoffDate.toISOString())
+      .select('id');
+
+    const count = deleted?.length || 0;
+
+    res.json({
+      success: true,
+      message: `Deleted ${count} expired meetings`,
+      deleted: count,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────────────
+// Get expiry settings
+// ─────────────────────────────────────────────────────
+app.get('/api/expiry/settings', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('transcript_expiry, voice_expiry, summary_expiry')
+      .eq('id', req.userId)
+      .single();
+
+    res.json({
+      transcriptExpiry: user?.transcript_expiry || 30,
+      voiceExpiry:      user?.voice_expiry      || 7,
+      summaryExpiry:    user?.summary_expiry     || 90,
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Save expiry settings
+app.post('/api/expiry/settings', authMiddleware, async (req, res) => {
+  try {
+    const { transcriptExpiry, voiceExpiry, summaryExpiry } = req.body;
+
+    await supabase.from('users').update({
+      transcript_expiry: transcriptExpiry,
+      voice_expiry:      voiceExpiry,
+      summary_expiry:    summaryExpiry,
+    }).eq('id', req.userId);
+
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
