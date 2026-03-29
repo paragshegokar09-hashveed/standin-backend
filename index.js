@@ -3617,7 +3617,7 @@ app.get('/api/meetings/list', authMiddleware, async (req, res) => {
       .eq('user_id', req.userId)
       .gte('created_at', new Date().toISOString().split('T')[0]);
 
-    const totalDuration = (todayCalls || []).reduce((sum: number, m: any) => sum + (m.duration || 0), 0);
+    const totalDuration = (todayCalls || []).reduce((sum, m) => sum + (m.duration || 0), 0);
 
     res.json({
       meetings:      meetings || [],
