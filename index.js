@@ -3594,8 +3594,8 @@ app.get('/api/meetings/report/:meetingId', authMiddleware, async (req, res) => {
 // ─────────────────────────────────────────────────────
 app.get('/api/meetings/list', authMiddleware, async (req, res) => {
   try {
-    const limit = parseInt(req.query.limit as string) || 20;
-    const page  = parseInt(req.query.page  as string) || 0;
+    const limit = parseInt(req.query.limit) || 20;
+    const page  = parseInt(req.query.page)  || 0;
 
     const { data: meetings, count } = await supabase
       .from('meetings')
