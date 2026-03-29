@@ -3373,6 +3373,139 @@ app.get('/api/twilio/status-check', authMiddleware, async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════
+// BIOMETRIC LOCK BACKEND ROUTES
+// Paste into index.js BEFORE "START SERVER" section
+// ═══════════════════════════════════════════════════
+
+const bcrypt = require('bcryptjs');
+
+// ─────────────────────────────────────────────────────
+// Save biometric settings
+// ─────────────────────────────────────────────────────
+app.post('/api/biometric/settings', authMiddleware, async (req, res) => {
+  try {
+    const { enabled, lockDelay, intruderPhoto, maxAttempts } = req.body;
+    await supabase.from('users').update({
+      biometric_enabled:       enabled,
+      biometric_delay:         lockDelay,
+      biometric_intruder_photo: intruderPhoto,
+      biometric_max_attempts:  maxAttempts || 3,
+    }).eq('id', req.userId);
+    res.json({ success: true });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get biometric settings
+app.get('/api/biometric/settings', authMiddleware, async (req, res) => {
+  try {
+    const { data: user } = await supabase
+      .from('users')
+      .select('biometric_enabled,biometric_delay,biometric_intruder_photo,biometric_max_attempts')
+      .eq('id', req.userId).single();
+    res.json({
+      enabled:      user?.biometric_enabled        || false,
+      lockDelay:    user?.biometric_delay          || 'immediately',
+      intruderPhoto:user?.biometric_intruder_photo || false,
+      maxAttempts:  user?.biometric_max_attempts   || 3,
+    });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────
+// Set PIN — hashes and saves securely
+// ─────────────────────────────────────────────────────
+app.post('/api/biometric/set-pin', authMiddleware, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    if (!pin || pin.length !== 4 || !/^\d{4}$/.test(pin)) {
+      return res.status(400).json({ error: 'PIN must be exactly 4 digits' });
+    }
+    // Hash PIN with bcrypt — never store plain PIN
+    const hashedPin = await bcrypt.hash(pin, 10);
+    await supabase.from('users').update({
+      pin_hash: hashedPin,
+    }).eq('id', req.userId);
+    res.json({ success: true, message: 'PIN set successfully' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────
+// Verify PIN — checks against hashed PIN
+// ─────────────────────────────────────────────────────
+app.post('/api/biometric/verify-pin', authMiddleware, async (req, res) => {
+  try {
+    const { pin } = req.body;
+    const { data: user } = await supabase
+      .from('users').select('pin_hash,biometric_max_attempts').eq('id', req.userId).single();
+
+    if (!user?.pin_hash) {
+      return res.status(400).json({ error: 'No PIN set', success: false });
+    }
+
+    const match = await bcrypt.compare(pin, user.pin_hash);
+
+    if (match) {
+      // Reset attempt counter on success
+      await supabase.from('users').update({
+        biometric_attempts: 0,
+      }).eq('id', req.userId);
+      res.json({ success: true });
+    } else {
+      // Increment attempt counter
+      const { data: updated } = await supabase.from('users')
+        .update({ biometric_attempts: supabase.rpc('increment', { x: 1 }) })
+        .eq('id', req.userId)
+        .select('biometric_attempts').single();
+
+      res.json({
+        success:          false,
+        attemptsUsed:     updated?.biometric_attempts || 1,
+        maxAttempts:      user?.biometric_max_attempts || 3,
+      });
+    }
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ─────────────────────────────────────────────────────
+// Intruder Alert — log failed attempts
+// ─────────────────────────────────────────────────────
+app.post('/api/biometric/intruder-alert', authMiddleware, async (req, res) => {
+  try {
+    const { attempts, timestamp, photoUrl } = req.body;
+
+    // Save intruder alert to database
+    await supabase.from('intruder_alerts').insert({
+      user_id:   req.userId,
+      attempts,
+      photo_url: photoUrl || null,
+      timestamp: timestamp || new Date().toISOString(),
+    });
+
+    // Notify user device via WebSocket
+    io.to(`user-${req.userId}`).emit('intruder-detected', {
+      attempts,
+      timestamp,
+      message: `${attempts} failed unlock attempts detected`,
+    });
+
+    res.json({ success: true, message: 'Intruder alert logged' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Get intruder alerts
+app.get('/api/biometric/intruder-alerts', authMiddleware, async (req, res) => {
+  try {
+    const { data: alerts } = await supabase
+      .from('intruder_alerts')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('timestamp', { ascending: false })
+      .limit(10);
+    res.json({ alerts: alerts || [] });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ═══════════════════════════════════════════════════
 // START SERVER
 // ═══════════════════════════════════════════════════
 const PORT = process.env.PORT || 3000;
