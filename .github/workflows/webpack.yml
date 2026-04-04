@@ -1,4 +1,8 @@
+<<<<<<< Updated upstream
 name: NodeJS with Webpack
+=======
+﻿name: Node.js CI
+>>>>>>> Stashed changes
 
 on:
   push:
@@ -9,6 +13,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+<<<<<<< Updated upstream
 
     strategy:
       matrix:
@@ -26,3 +31,16 @@ jobs:
       run: |
         npm install
         npx webpack
+=======
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+      - run: npm ci --if-present
+>>>>>>> Stashed changes

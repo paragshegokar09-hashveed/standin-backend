@@ -1,13 +1,18 @@
+<<<<<<< Updated upstream
 # This workflow will run tests using node and then publish a package to GitHub Packages when a release is created
 # For more information see: https://docs.github.com/en/actions/publishing-packages/publishing-nodejs-packages
 
 name: Node.js Package
+=======
+﻿name: Publish to NPM
+>>>>>>> Stashed changes
 
 on:
   release:
     types: [created]
 
 jobs:
+<<<<<<< Updated upstream
   build:
     runs-on: ubuntu-latest
     steps:
@@ -20,14 +25,26 @@ jobs:
 
   publish-npm:
     needs: build
+=======
+  publish-npm:
+>>>>>>> Stashed changes
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
+<<<<<<< Updated upstream
           node-version: 20
           registry-url: https://registry.npmjs.org/
       - run: npm ci
       - run: npm publish
         env:
           NODE_AUTH_TOKEN: ${{secrets.npm_token}}
+=======
+          node-version: '20.x'
+          registry-url: 'https://registry.npmjs.org'
+      - run: npm ci --if-present
+      - run: npm publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+>>>>>>> Stashed changes
