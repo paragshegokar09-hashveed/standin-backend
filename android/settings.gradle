@@ -1,20 +1,19 @@
 pluginManagement {
-    // Plugin repositories for both the plugins {} DSL and classpath resolution.
+    // includeBuild inside pluginManagement makes the React Native Gradle plugin
+    // available for BOTH plugin-id resolution (apply plugin / plugins {}) AND
+    // classpath() coordinate resolution in buildscript blocks — without needing
+    // an explicit version number.
+    // Skipped when node_modules is absent (e.g. before `npm install`) so that
+    // tasks like `clean` still work pre-install.
+    def rnPlugin = file("../node_modules/@react-native/gradle-plugin")
+    if (rnPlugin.exists()) {
+        includeBuild(rnPlugin.absolutePath)
+    }
     repositories {
         google()
         mavenCentral()
         gradlePluginPortal()
     }
-}
-
-// Top-level includeBuild (outside pluginManagement) makes the React Native
-// Gradle plugin available to ALL sub-projects via composite build — no
-// classpath() entry needed and no version number required.
-// This block is skipped when node_modules does not exist yet (e.g. before
-// `npm install` is run), so tasks like `clean` still work pre-install.
-def rnPlugin = file("../node_modules/@react-native/gradle-plugin")
-if (rnPlugin.exists()) {
-    includeBuild(rnPlugin.absolutePath)
 }
 
 rootProject.name = 'StandIn'

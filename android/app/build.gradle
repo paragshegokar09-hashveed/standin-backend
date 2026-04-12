@@ -38,16 +38,17 @@ android {
         }
         release {
             signingConfig signingConfigs.debug
-            minifyEnabled enableProguardInReleaseBuilds
+            // enableProguardInReleaseBuilds is set by the React Native Gradle plugin.
+            // Fall back to false when building without node_modules (e.g. `clean`).
+            minifyEnabled (rnPlugin.exists() ? enableProguardInReleaseBuilds : false)
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
 }
 
 dependencies {
-    // React Native dependencies are only needed when building the full app.
-    // They are omitted here intentionally; the user's actual app/build.gradle
-    // should declare com.facebook.react:react-android and hermes-android.
+    // Versions are managed by the React Native BOM that the 'com.facebook.react'
+    // plugin applies automatically once node_modules is present.
     implementation("com.facebook.react:react-android")
     implementation("com.facebook.react:hermes-android")
 }
