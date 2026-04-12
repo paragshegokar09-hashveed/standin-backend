@@ -1,8 +1,10 @@
 pluginManagement {
-    // The React Native Gradle plugin lives inside node_modules and is only
-    // available after `npm install` has been run in the project root.
-    // We guard the includeBuild so the project can still configure (e.g. clean)
-    // before node_modules exists.
+    // includeBuild inside pluginManagement makes the React Native Gradle plugin
+    // available for BOTH plugin-id resolution (apply plugin / plugins {}) AND
+    // classpath() coordinate resolution in buildscript blocks — without needing
+    // an explicit version number.
+    // Skipped when node_modules is absent (e.g. before `npm install`) so that
+    // tasks like `clean` still work pre-install.
     def rnPlugin = file("../node_modules/@react-native/gradle-plugin")
     if (rnPlugin.exists()) {
         includeBuild(rnPlugin.absolutePath)
