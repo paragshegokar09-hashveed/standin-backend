@@ -12,9 +12,12 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle")
+        // AGP version must be explicit; Kotlin version comes from ext.kotlinVersion above.
+        // react-native-gradle-plugin version is resolved from the includeBuild in
+        // settings.gradle (requires `npm install` to have been run first).
+        classpath("com.android.tools.build:gradle:8.1.1")
         classpath("com.facebook.react:react-native-gradle-plugin")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
     }
 }
 
