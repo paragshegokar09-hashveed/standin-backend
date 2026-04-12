@@ -12,10 +12,18 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle")
-        classpath("com.facebook.react:react-native-gradle-plugin")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin")
+        classpath("com.android.tools.build:gradle:8.1.1")
+        // react-native-gradle-plugin version is resolved via the includeBuild declared in
+        // settings.gradle, which only activates after `npm install` has been run.
+        // The classpath entry is omitted when node_modules does not exist yet so that
+        // basic tasks like `clean` can still run before JS dependencies are installed.
+        if (file("../node_modules/@react-native/gradle-plugin").exists()) {
+            classpath("com.facebook.react:react-native-gradle-plugin")
+        }
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
     }
 }
 
-apply plugin: "com.facebook.react.rootproject"
+if (file("../node_modules/@react-native/gradle-plugin").exists()) {
+    apply plugin: "com.facebook.react.rootproject"
+}
