@@ -6,6 +6,15 @@ buildscript {
         targetSdkVersion = 34
         ndkVersion = "25.1.8937393"
         kotlinVersion = "1.8.0"
+
+        // Detect the React Native Gradle Plugin version from node_modules so no
+        // hard-coded version is needed. Falls back to 0.73.6 (published on Maven
+        // Central) when node_modules is absent (e.g. before `npm install`), which
+        // allows `gradlew clean` to succeed without node_modules present.
+        def rnGradlePluginPkg = new File("$rootDir/../node_modules/@react-native/gradle-plugin/package.json")
+        reactNativeGradlePluginVersion = rnGradlePluginPkg.exists()
+            ? new groovy.json.JsonSlurper().parse(rnGradlePluginPkg).version
+            : "0.73.6"
     }
     repositories {
         google()
@@ -14,10 +23,11 @@ buildscript {
     dependencies {
         classpath("com.android.tools.build:gradle:8.1.1")
         classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
-        // Version is provided by the composite build registered in pluginManagement
-        // (settings.gradle) — no explicit version number needed.
-        classpath("com.facebook.react:react-native-gradle-plugin")
+        classpath("com.facebook.react:react-native-gradle-plugin:${reactNativeGradlePluginVersion}")
     }
 }
 
-apply plugin: "com.facebook.react.rootproject"
+def rnPlugin = file("../node_modules/@react-native/gradle-plugin")
+if (rnPlugin.exists()) {
+    apply plugin: "com.facebook.react.rootproject"
+}
