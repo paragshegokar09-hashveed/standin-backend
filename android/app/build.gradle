@@ -1,12 +1,5 @@
 apply plugin: "com.android.application"
-
-// The React Native plugin is provided by a composite build (includeBuild in
-// settings.gradle). It is only applied when node_modules is populated, so that
-// tasks like `clean` continue to work before `npm install` is run.
-def rnPlugin = new File(rootProject.projectDir, "../node_modules/@react-native/gradle-plugin")
-if (rnPlugin.exists()) {
-    apply plugin: "com.facebook.react"
-}
+apply plugin: "com.facebook.react"
 
 android {
     ndkVersion rootProject.ext.ndkVersion
@@ -38,17 +31,15 @@ android {
         }
         release {
             signingConfig signingConfigs.debug
-            // enableProguardInReleaseBuilds is set by the React Native Gradle plugin.
-            // Fall back to false when building without node_modules (e.g. `clean`).
-            minifyEnabled (rnPlugin.exists() ? enableProguardInReleaseBuilds : false)
+            minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
 }
 
 dependencies {
-    // Versions are managed by the React Native BOM that the 'com.facebook.react'
-    // plugin applies automatically once node_modules is present.
+    // Versions are managed by the React Native BOM applied by the
+    // 'com.facebook.react' plugin above.
     implementation("com.facebook.react:react-android")
     implementation("com.facebook.react:hermes-android")
 }
