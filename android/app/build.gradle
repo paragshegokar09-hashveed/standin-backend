@@ -1,9 +1,11 @@
 apply plugin: "com.android.application"
-apply plugin: "com.facebook.react"
 
-react {
-    // hermesEnabled, autolinking, and other React Native options are
-    // configured in android/gradle.properties
+// The React Native plugin is provided by a composite build (includeBuild in
+// settings.gradle). It is only applied when node_modules is populated, so that
+// tasks like `clean` continue to work before `npm install` is run.
+def rnPlugin = new File(rootProject.projectDir, "../node_modules/@react-native/gradle-plugin")
+if (rnPlugin.exists()) {
+    apply plugin: "com.facebook.react"
 }
 
 android {
@@ -43,6 +45,9 @@ android {
 }
 
 dependencies {
+    // React Native dependencies are only needed when building the full app.
+    // They are omitted here intentionally; the user's actual app/build.gradle
+    // should declare com.facebook.react:react-android and hermes-android.
     implementation("com.facebook.react:react-android")
     implementation("com.facebook.react:hermes-android")
 }
