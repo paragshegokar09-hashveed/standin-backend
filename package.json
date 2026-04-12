@@ -17,7 +17,7 @@
     "firebase-admin": "^11.11.1",
     "googleapis": "^140.0.1",
     "jsonwebtoken": "^9.0.2",
-    "multer": "^1.4.5-lts.1",
+    "multer": "^2.1.1",
     "nodemailer": "^6.9.7",
     "socket.io": "^4.6.1",
     "twilio": "^5.0.0",
