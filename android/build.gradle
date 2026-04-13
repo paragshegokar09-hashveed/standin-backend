@@ -12,11 +12,13 @@ buildscript {
         mavenCentral()
     }
     dependencies {
-        // Versions are resolved from the version catalog initialised by
-        // com.facebook.react.settings in settings.gradle (via the composite
-        // build registered with pluginManagement.includeBuild above).
-        // No explicit version numbers are required.
-        classpath("com.android.tools.build:gradle")
+        // AGP must have an explicit version — the composite build does NOT
+        // provide classpath coordinate versions for non-React-Native artifacts.
+        classpath("com.android.tools.build:gradle:8.5.0")
+        // Kotlin plugin — explicit version required for the same reason.
+        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
+        // React Native Gradle plugin version comes from the composite build
+        // registered via pluginManagement.includeBuild in settings.gradle.
         classpath("com.facebook.react:react-native-gradle-plugin")
     }
 }
