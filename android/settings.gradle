@@ -1,24 +1,14 @@
 pluginManagement {
-    includeBuild("../node_modules/@react-native/gradle-plugin")
+    // Use settingsDir (the android/ directory) to build the canonical absolute
+    // path to the React Native Gradle plugin, avoiding Windows path-resolution
+    // issues with the '@' character in the @react-native scoped npm directory.
+    includeBuild(new File(settingsDir.parentFile, "node_modules/@react-native/gradle-plugin").canonicalPath)
     repositories {
         google()
         mavenCentral()
         gradlePluginPortal()
     }
 }
-
-// Required for React Native 0.76+ (new architecture). Initialises the RN
-// settings extension and version catalog that makes classpath() entries work
-// without explicit version numbers.
-plugins {
-    id("com.facebook.react.settings")
-}
-
-// autolinkLibrariesFromCommand() is intentionally omitted here.
-// It runs a `cmd` Node.js process to discover native libraries, which fails
-// when `node` is not on the PATH used by Android Studio / Gradle daemon.
-// Native module autolinking is configured per-project in app/build.gradle
-// via the com.facebook.react plugin instead.
 
 rootProject.name = 'StandIn'
 include ':app'
