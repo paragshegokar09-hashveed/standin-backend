@@ -1,9 +1,5 @@
 apply plugin: "com.android.application"
-
-def rnPlugin = new File(rootProject.projectDir, "../node_modules/@react-native/gradle-plugin")
-if (rnPlugin.exists()) {
-    apply plugin: "com.facebook.react"
-}
+apply plugin: "com.facebook.react"
 
 android {
     ndkVersion rootProject.ext.ndkVersion
@@ -35,19 +31,14 @@ android {
         }
         release {
             signingConfig signingConfigs.debug
-            // enableProguardInReleaseBuilds is set by the React Native plugin.
-            // Falls back to false when the plugin is not applied (no node_modules).
-            minifyEnabled (rnPlugin.exists() ? enableProguardInReleaseBuilds : false)
+            minifyEnabled enableProguardInReleaseBuilds
             proguardFiles getDefaultProguardFile("proguard-android.txt"), "proguard-rules.pro"
         }
     }
 }
 
 dependencies {
-    // Versions are resolved via the React Native BOM applied by the
-    // 'com.facebook.react' plugin. Only included when node_modules is present.
-    if (rnPlugin.exists()) {
-        implementation("com.facebook.react:react-android")
-        implementation("com.facebook.react:hermes-android")
-    }
+    // Versions are set automatically by the "com.facebook.react" plugin
+    implementation("com.facebook.react:react-android")
+    implementation("com.facebook.react:hermes-android")
 }
