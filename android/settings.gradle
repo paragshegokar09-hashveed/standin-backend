@@ -14,9 +14,11 @@ plugins {
     id("com.facebook.react.settings")
 }
 
-extensions.configure(com.facebook.react.ReactSettingsExtension) { ex ->
-    ex.autolinkLibrariesFromCommand()
-}
+// autolinkLibrariesFromCommand() is intentionally omitted here.
+// It runs a `cmd` Node.js process to discover native libraries, which fails
+// when `node` is not on the PATH used by Android Studio / Gradle daemon.
+// Native module autolinking is configured per-project in app/build.gradle
+// via the com.facebook.react plugin instead.
 
 rootProject.name = 'StandIn'
 include ':app'
