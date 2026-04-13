@@ -1,28 +1,24 @@
 buildscript {
     ext {
-        buildToolsVersion = "34.0.0"
-        minSdkVersion = 23
-        compileSdkVersion = 34
-        targetSdkVersion = 34
-        ndkVersion = "25.1.8937393"
-        kotlinVersion = "1.8.0"
+        buildToolsVersion = "35.0.0"
+        minSdkVersion = 24
+        compileSdkVersion = 35
+        targetSdkVersion = 35
+        ndkVersion = "26.1.10909125"
+        kotlinVersion = "2.0.21"
     }
     repositories {
         google()
         mavenCentral()
     }
     dependencies {
-        classpath("com.android.tools.build:gradle:8.1.1")
-        classpath("org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlinVersion")
-        // react-native-gradle-plugin is registered via the includeBuild inside
-        // pluginManagement (settings.gradle).  No classpath() entry is needed
-        // and no version number is required — the composite build provides it.
+        // Versions are resolved from the version catalog initialised by
+        // com.facebook.react.settings in settings.gradle (via the composite
+        // build registered with pluginManagement.includeBuild above).
+        // No explicit version numbers are required.
+        classpath("com.android.tools.build:gradle")
+        classpath("com.facebook.react:react-native-gradle-plugin")
     }
 }
 
-// Apply the React Native root-project plugin only when node_modules exists
-// so that tasks like `clean` work before `npm install` is run.
-def rnPlugin = file("../node_modules/@react-native/gradle-plugin")
-if (rnPlugin.exists()) {
-    apply plugin: "com.facebook.react.rootproject"
-}
+apply plugin: "com.facebook.react.rootproject"
